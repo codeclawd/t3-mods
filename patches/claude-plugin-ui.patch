@@ -1,0 +1,1392 @@
+From 091db8857d76b3c3b4972f62756001bb946b0f61 Mon Sep 17 00:00:00 2001
+From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 20:15:22 -0500
+Subject: [PATCH 1/2] feat(claude): draw Claude Code plugin status lines,
+ toasts and prompt band
+
+Claude Code plugins draw UI with $.ui.status, $.ui.toast and an
+AbovePrompt ui.render hook. In a headless session the CLI pushes
+ui_status / ui_toast / ui_invalidate system messages and draws the band
+only when asked with a ui_render control request. T3 dropped all of it.
+
+The Claude query runner now hands those messages and the query's
+control-request sender to a ClaudePluginUi service, which keeps a
+per-thread snapshot (status lines, latest toast, band tree) and asks
+for the band on attach and on each invalidate. Clients subscribe over a
+new provider.claude.plugin-ui.subscribe stream; buttons go back through
+provider.claude.plugin-ui.press. The web composer draws the band,
+status lines and toasts. Nothing is persisted.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/server/src/auth/RpcAuthorization.ts      |   2 +
+ .../Adapters/ClaudeAdapterV2.ts               |  26 +-
+ .../src/provider/ClaudePluginUi.test.ts       | 174 +++++++++++
+ apps/server/src/provider/ClaudePluginUi.ts    | 254 +++++++++++++++
+ ...viderOrchestrationAdapterInfrastructure.ts |   5 +-
+ apps/server/src/server.ts                     |   8 +-
+ apps/server/src/ws.ts                         |  12 +
+ apps/web/src/components/ChatView.tsx          |   4 +
+ .../components/chat/ClaudePluginUiBand.tsx    | 292 ++++++++++++++++++
+ packages/client-runtime/src/rpc/client.ts     |   1 +
+ packages/client-runtime/src/state/server.ts   |   9 +
+ packages/contracts/src/claudePluginUi.ts      |  85 +++++
+ packages/contracts/src/index.ts               |   1 +
+ packages/contracts/src/rpc.ts                 |  21 ++
+ 14 files changed, 891 insertions(+), 3 deletions(-)
+ create mode 100644 apps/server/src/provider/ClaudePluginUi.test.ts
+ create mode 100644 apps/server/src/provider/ClaudePluginUi.ts
+ create mode 100644 apps/web/src/components/chat/ClaudePluginUiBand.tsx
+ create mode 100644 packages/contracts/src/claudePluginUi.ts
+
+diff --git a/apps/server/src/auth/RpcAuthorization.ts b/apps/server/src/auth/RpcAuthorization.ts
+index 54d8e2a9..630c6e3e 100644
+--- a/apps/server/src/auth/RpcAuthorization.ts
++++ b/apps/server/src/auth/RpcAuthorization.ts
+@@ -58,6 +58,8 @@ export const RPC_REQUIRED_SCOPES = {
+   [WS_METHODS.providerInstallCancel]: AuthOrchestrationOperateScope,
+   [WS_METHODS.providerInstallSubscribe]: AuthOrchestrationReadScope,
+   [WS_METHODS.providerInstallRemove]: AuthOrchestrationOperateScope,
++  [WS_METHODS.claudePluginUiSubscribe]: AuthOrchestrationReadScope,
++  [WS_METHODS.claudePluginUiPress]: AuthOrchestrationOperateScope,
+   [WS_METHODS.serverUpdateServer]: AuthOrchestrationOperateScope,
+   [WS_METHODS.serverUpdateServerWithProgress]: AuthOrchestrationOperateScope,
+   [WS_METHODS.serverCommitDesktopUpdate]: AuthOrchestrationOperateScope,
+diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+index b2beb04c..af751ae6 100644
+--- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
++++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
+@@ -108,6 +108,7 @@ import {
+   shouldPersistProviderEvent,
+ } from "../../provider/Layers/EventNdjsonLogger.ts";
+ import * as ProviderEventLoggers from "../../provider/Layers/ProviderEventLoggers.ts";
++import * as ClaudePluginUi from "../../provider/ClaudePluginUi.ts";
+ import {
+   claudeRateLimitEventToUpdate,
+   type ClaudeScopedLimitNames,
+@@ -591,15 +592,26 @@ export function makeClaudeAgentSdkProtocolLogger(input: {
+   };
+ }
+ 
++/** The SDK `Query`'s control-request sender, when this SDK build has one. */
++const claudeControlRequestOf = (
++  queryRuntime: unknown,
++): ClaudePluginUi.ClaudeControlRequest | undefined => {
++  const request = (queryRuntime as { request?: unknown }).request;
++  return typeof request === "function"
++    ? (body) => (request as ClaudePluginUi.ClaudeControlRequest).call(queryRuntime, body)
++    : undefined;
++};
++
+ export const claudeAgentSdkQueryRunnerLiveLayer: Layer.Layer<
+   ClaudeAgentSdkQueryRunner,
+   never,
+-  Crypto.Crypto | ProviderEventLoggers.ProviderEventLoggers
++  Crypto.Crypto | ProviderEventLoggers.ProviderEventLoggers | ClaudePluginUi.ClaudePluginUi
+ > = Layer.effect(
+   ClaudeAgentSdkQueryRunner,
+   Effect.gen(function* () {
+     const crypto = yield* Crypto.Crypto;
+     const { native: nativeEventLogger } = yield* ProviderEventLoggers.ProviderEventLoggers;
++    const pluginUi = yield* ClaudePluginUi.ClaudePluginUi;
+ 
+     return ClaudeAgentSdkQueryRunner.of({
+       allocateSessionId: crypto.randomUUIDv4.pipe(
+@@ -630,6 +642,12 @@ export const claudeAgentSdkQueryRunnerLiveLayer: Layer.Layer<
+             }),
+           catch: (cause) => queryRunnerError(cause, "query"),
+         });
++        // Plugin UI (`ui_render`, `ui_press`) rides the SDK's control-request
++        // channel, which the SDK only exposes as an untyped method.
++        const pluginUiRequest = claudeControlRequestOf(queryRuntime);
++        if (pluginUiRequest !== undefined) {
++          yield* pluginUi.attach(input.threadId, pluginUiRequest);
++        }
+         yield* logProtocolEvent({
+           direction: "outgoing",
+           stage: "decoded",
+@@ -650,6 +668,7 @@ export const claudeAgentSdkQueryRunnerLiveLayer: Layer.Layer<
+                 payload: message,
+               }),
+             ),
++            Stream.tap((message) => pluginUi.ingest(input.threadId, message)),
+           ),
+           offer: (message) =>
+             Queue.offer(promptQueue, message).pipe(
+@@ -713,6 +732,11 @@ export const claudeAgentSdkQueryRunnerLiveLayer: Layer.Layer<
+           ),
+           close: Queue.shutdown(promptQueue).pipe(
+             Effect.andThen(closeClaudeQuery(queryRuntime)),
++            Effect.ensuring(
++              pluginUiRequest === undefined
++                ? Effect.void
++                : pluginUi.detach(input.threadId, pluginUiRequest),
++            ),
+             Effect.tap(() =>
+               logProtocolEvent({
+                 direction: "outgoing",
+diff --git a/apps/server/src/provider/ClaudePluginUi.test.ts b/apps/server/src/provider/ClaudePluginUi.test.ts
+new file mode 100644
+index 00000000..c1fa356c
+--- /dev/null
++++ b/apps/server/src/provider/ClaudePluginUi.test.ts
+@@ -0,0 +1,174 @@
++import { assert, describe, it } from "@effect/vitest";
++import { ThreadId } from "@t3tools/contracts";
++import * as Effect from "effect/Effect";
++import * as Option from "effect/Option";
++import * as Stream from "effect/Stream";
++
++import * as ClaudePluginUi from "./ClaudePluginUi.ts";
++
++const threadId = ThreadId.make("thread-plugin-ui");
++const band = { type: "Box", children: [{ type: "Text", children: ["5h 42%"] }] };
++
++const latest = (service: ClaudePluginUi.ClaudePluginUiShape) =>
++  service.subscribe(threadId).pipe(Stream.runHead, Effect.map(Option.getOrThrow));
++
++/** The first snapshot, current or upcoming, that satisfies `predicate`. */
++const awaitSnapshot = (
++  service: ClaudePluginUi.ClaudePluginUiShape,
++  predicate: (snapshot: Effect.Success<ReturnType<typeof latest>>) => boolean,
++) =>
++  service
++    .subscribe(threadId)
++    .pipe(Stream.filter(predicate), Stream.runHead, Effect.map(Option.getOrThrow));
++
++describe("ClaudePluginUi", () => {
++  it.effect("keeps one status line per plugin and removes it on null", () =>
++    Effect.gen(function* () {
++      const service = yield* ClaudePluginUi.make;
++      const status = (plugin: string, text: string | null) =>
++        service.ingest(threadId, { type: "system", subtype: "ui_status", plugin, text });
++
++      yield* status("tier-badge", "T1 small");
++      yield* status("usage-deck", "ctx 40%");
++      yield* status("tier-badge", "T2 feature");
++      assert.deepStrictEqual((yield* latest(service)).statuses, [
++        { plugin: "usage-deck", text: "ctx 40%" },
++        { plugin: "tier-badge", text: "T2 feature" },
++      ]);
++
++      yield* status("tier-badge", null);
++      assert.deepStrictEqual((yield* latest(service)).statuses, [
++        { plugin: "usage-deck", text: "ctx 40%" },
++      ]);
++    }),
++  );
++
++  it.effect("keeps the latest toast with its id and timeout", () =>
++    Effect.gen(function* () {
++      const service = yield* ClaudePluginUi.make;
++      yield* service.ingest(threadId, {
++        type: "system",
++        subtype: "ui_toast",
++        plugin: "blast-radius",
++        text: "3 files touched",
++        timeout_ms: 2500,
++        uuid: "toast-uuid",
++      });
++      assert.deepStrictEqual((yield* latest(service)).toast, {
++        id: "toast-uuid",
++        plugin: "blast-radius",
++        text: "3 files touched",
++        timeoutMs: 2500,
++      });
++    }),
++  );
++
++  it.effect("asks the CLI for the AbovePrompt band on attach and on invalidate", () =>
++    Effect.gen(function* () {
++      const service = yield* ClaudePluginUi.make;
++      const requests: Array<Record<string, unknown>> = [];
++      let hooked = true;
++      const request: ClaudePluginUi.ClaudeControlRequest = async (body) => {
++        requests.push(body);
++        return { subtype: "success", request_id: "r1", response: { tree: band, hooked } };
++      };
++
++      yield* service.attach(threadId, request);
++      const drawn = yield* awaitSnapshot(service, (snapshot) => snapshot.band !== null);
++      assert.deepStrictEqual(drawn.band, band);
++      assert.strictEqual(requests[0]?.subtype, "ui_render");
++      assert.strictEqual(requests[0]?.surface, "desktop");
++      assert.strictEqual(requests[0]?.component, "AbovePrompt");
++
++      hooked = false;
++      yield* service.ingest(threadId, { type: "system", subtype: "ui_invalidate" });
++      const cleared = yield* awaitSnapshot(service, (snapshot) => snapshot.band === null);
++      assert.strictEqual(cleared.band, null);
++    }),
++  );
++
++  it.effect("ignores the engine's placeholder tree", () =>
++    Effect.sync(() => {
++      assert.strictEqual(
++        ClaudePluginUi.bandFromRenderResponse({
++          subtype: "success",
++          response: { tree: { type: "engine", ref: 0 }, hooked: true },
++        }),
++        null,
++      );
++      assert.deepStrictEqual(
++        ClaudePluginUi.bandFromRenderResponse({
++          subtype: "success",
++          response: { tree: band, hooked: true },
++        }),
++        band,
++      );
++    }),
++  );
++
++  it.effect("clears on detach only for the query that attached", () =>
++    Effect.gen(function* () {
++      const service = yield* ClaudePluginUi.make;
++      const first: ClaudePluginUi.ClaudeControlRequest = async () => ({ hooked: false });
++      const second: ClaudePluginUi.ClaudeControlRequest = async () => ({ hooked: false });
++      yield* service.attach(threadId, first);
++      yield* service.ingest(threadId, {
++        type: "system",
++        subtype: "ui_status",
++        plugin: "tier-badge",
++        text: "T1",
++      });
++      yield* service.attach(threadId, second);
++
++      yield* service.detach(threadId, first);
++      assert.strictEqual((yield* latest(service)).statuses.length, 1);
++
++      yield* service.detach(threadId, second);
++      assert.strictEqual((yield* latest(service)).statuses.length, 0);
++    }),
++  );
++
++  it.effect("drops a render that resolves after its query detached", () =>
++    Effect.gen(function* () {
++      const service = yield* ClaudePluginUi.make;
++      let resolveRender: (value: unknown) => void = () => {};
++      let markInFlight: () => void = () => {};
++      const inFlight = new Promise<void>((resolve) => {
++        markInFlight = resolve;
++      });
++      const request: ClaudePluginUi.ClaudeControlRequest = () =>
++        new Promise((resolve) => {
++          resolveRender = resolve;
++          markInFlight();
++        });
++      yield* service.attach(threadId, request);
++      yield* Effect.promise(() => inFlight);
++      yield* service.detach(threadId, request);
++      resolveRender({ subtype: "success", response: { tree: band, hooked: true } });
++      yield* Effect.promise(() => new Promise((resolve) => setImmediate(resolve)));
++      assert.strictEqual((yield* latest(service)).band, null);
++    }),
++  );
++
++  it.effect("forwards a press to the live query", () =>
++    Effect.gen(function* () {
++      const service = yield* ClaudePluginUi.make;
++      const requests: Array<Record<string, unknown>> = [];
++      yield* service.attach(threadId, async (body) => {
++        requests.push(body);
++        return { hooked: false };
++      });
++      yield* service.press({ threadId, plugin: "usage-deck", handle: 7, key: "refresh" });
++      assert.deepStrictEqual(
++        requests.find((body) => body.subtype === "ui_press"),
++        {
++          subtype: "ui_press",
++          plugin: "usage-deck",
++          handle: 7,
++          surface: "desktop",
++          key: "refresh",
++        },
++      );
++    }),
++  );
++});
+diff --git a/apps/server/src/provider/ClaudePluginUi.ts b/apps/server/src/provider/ClaudePluginUi.ts
+new file mode 100644
+index 00000000..cbf9267f
+--- /dev/null
++++ b/apps/server/src/provider/ClaudePluginUi.ts
+@@ -0,0 +1,254 @@
++/**
++ * ClaudePluginUi — the latest UI that Claude Code plugins drew for each
++ * Claude thread: `$.ui.status` lines, the last `$.ui.toast` and the
++ * `AbovePrompt` band a plugin's `ui.render` hook returns.
++ *
++ * A headless Claude session pushes `system` messages (`ui_status`,
++ * `ui_toast`, `ui_invalidate`) and draws a band only when asked with a
++ * `ui_render` control request. The query runner hands every message to
++ * `ingest` and registers the live query's control-request sender with
++ * `attach`; this service asks for the band on attach and on each
++ * invalidate, and clients subscribe to the per-thread snapshot.
++ *
++ * The protocol is internal to the Claude CLI. Any failure here is logged and
++ * leaves the thread without plugin UI; it never affects a turn.
++ */
++import {
++  type ClaudePluginUiElement,
++  type ClaudePluginUiPressInput,
++  type ClaudePluginUiSnapshot,
++  EMPTY_CLAUDE_PLUGIN_UI_SNAPSHOT,
++  type ThreadId,
++} from "@t3tools/contracts";
++import * as Context from "effect/Context";
++import * as Effect from "effect/Effect";
++import * as Layer from "effect/Layer";
++import * as PubSub from "effect/PubSub";
++import * as Stream from "effect/Stream";
++
++/** Sends one control request on the thread's live Claude query. */
++export type ClaudeControlRequest = (request: Record<string, unknown>) => Promise<unknown>;
++
++const BAND_INSTANCE_ID = "above-prompt";
++const BAND_MAX_ROWS = 12;
++const BAND_COLUMNS = 80;
++
++interface ThreadEntry {
++  request: ClaudeControlRequest | undefined;
++  snapshot: ClaudePluginUiSnapshot;
++  rendering: boolean;
++  renderAgain: boolean;
++}
++
++interface Change {
++  readonly threadId: ThreadId;
++  readonly snapshot: ClaudePluginUiSnapshot;
++}
++
++export interface ClaudePluginUiShape {
++  readonly attach: (threadId: ThreadId, request: ClaudeControlRequest) => Effect.Effect<void>;
++  readonly detach: (threadId: ThreadId, request: ClaudeControlRequest) => Effect.Effect<void>;
++  readonly ingest: (threadId: ThreadId, message: unknown) => Effect.Effect<void>;
++  readonly subscribe: (threadId: ThreadId) => Stream.Stream<ClaudePluginUiSnapshot>;
++  readonly press: (input: ClaudePluginUiPressInput) => Effect.Effect<void>;
++}
++
++export class ClaudePluginUi extends Context.Service<ClaudePluginUi, ClaudePluginUiShape>()(
++  "t3/provider/ClaudePluginUi",
++) {}
++
++const isRecord = (value: unknown): value is Record<string, unknown> =>
++  typeof value === "object" && value !== null && !Array.isArray(value);
++
++/**
++ * A band tree worth drawing: an element the plugins drew, not the engine's own
++ * placeholder. The SDK resolves a control request with the whole
++ * `{ subtype, request_id, response }` envelope.
++ */
++export const bandFromRenderResponse = (envelope: unknown): ClaudePluginUiElement | null => {
++  const response = isRecord(envelope) ? envelope.response : undefined;
++  if (!isRecord(response) || response.hooked !== true) return null;
++  const tree = response.tree;
++  if (!isRecord(tree) || typeof tree.type !== "string" || tree.type === "engine") return null;
++  return tree as unknown as ClaudePluginUiElement;
++};
++
++export const make = Effect.gen(function* () {
++  const threads = new Map<ThreadId, ThreadEntry>();
++  let toastCount = 0;
++  const changes = yield* PubSub.unbounded<Change>();
++
++  const entryFor = (threadId: ThreadId): ThreadEntry => {
++    let entry = threads.get(threadId);
++    if (entry === undefined) {
++      entry = {
++        request: undefined,
++        snapshot: EMPTY_CLAUDE_PLUGIN_UI_SNAPSHOT,
++        rendering: false,
++        renderAgain: false,
++      };
++      threads.set(threadId, entry);
++    }
++    return entry;
++  };
++
++  const update = (
++    threadId: ThreadId,
++    next: (snapshot: ClaudePluginUiSnapshot) => ClaudePluginUiSnapshot,
++  ) =>
++    Effect.suspend(() => {
++      const entry = entryFor(threadId);
++      const snapshot = next(entry.snapshot);
++      if (snapshot === entry.snapshot) return Effect.void;
++      entry.snapshot = snapshot;
++      return PubSub.publish(changes, { threadId, snapshot }).pipe(Effect.asVoid);
++    });
++
++  const renderBand = (threadId: ThreadId, request: ClaudeControlRequest) =>
++    Effect.tryPromise(() =>
++      request({
++        subtype: "ui_render",
++        surface: "desktop",
++        component: "AbovePrompt",
++        instance_id: BAND_INSTANCE_ID,
++        props: {
++          hasSurvey: false,
++          isWorking: false,
++          maxRows: BAND_MAX_ROWS,
++          bodyColumns: BAND_COLUMNS,
++          scroll: { offset: 0, bodyRows: BAND_MAX_ROWS },
++        },
++      }),
++    ).pipe(
++      Effect.flatMap((response) =>
++        // The query may have closed (or been replaced) while the render was in flight.
++        threads.get(threadId)?.request === request
++          ? update(threadId, (snapshot) => ({
++              ...snapshot,
++              band: bandFromRenderResponse(response),
++            }))
++          : Effect.void,
++      ),
++      Effect.catchCause((cause) =>
++        Effect.logDebug("claude-plugin-ui.render-failed", { threadId, cause }),
++      ),
++    );
++
++  /** Asks for the band, folding invalidates that land while a render is in flight into one more. */
++  const requestRender = (threadId: ThreadId) =>
++    Effect.suspend(() => {
++      const entry = entryFor(threadId);
++      if (entry.request === undefined) return Effect.void;
++      if (entry.rendering) {
++        entry.renderAgain = true;
++        return Effect.void;
++      }
++      entry.rendering = true;
++      const loop: Effect.Effect<void> = Effect.suspend(() => {
++        const request = entry.request;
++        entry.renderAgain = false;
++        if (request === undefined) return Effect.void;
++        return renderBand(threadId, request).pipe(
++          Effect.andThen(Effect.suspend(() => (entry.renderAgain ? loop : Effect.void))),
++        );
++      });
++      return loop.pipe(
++        Effect.ensuring(
++          Effect.sync(() => {
++            entry.rendering = false;
++          }),
++        ),
++        Effect.forkDetach,
++        Effect.asVoid,
++      );
++    });
++
++  const attach: ClaudePluginUiShape["attach"] = (threadId, request) =>
++    Effect.suspend(() => {
++      entryFor(threadId).request = request;
++      return requestRender(threadId);
++    });
++
++  const detach: ClaudePluginUiShape["detach"] = (threadId, request) =>
++    Effect.suspend(() => {
++      const entry = threads.get(threadId);
++      // A replacement query may already have attached; only its own close clears it.
++      if (entry === undefined || entry.request !== request) return Effect.void;
++      entry.request = undefined;
++      return update(threadId, () => EMPTY_CLAUDE_PLUGIN_UI_SNAPSHOT);
++    });
++
++  const ingest: ClaudePluginUiShape["ingest"] = (threadId, message) => {
++    if (!isRecord(message) || message.type !== "system") return Effect.void;
++    switch (message.subtype) {
++      case "ui_status": {
++        if (typeof message.plugin !== "string") return Effect.void;
++        const plugin = message.plugin;
++        const text = typeof message.text === "string" && message.text !== "" ? message.text : null;
++        return update(threadId, (snapshot) => {
++          const others = snapshot.statuses.filter((status) => status.plugin !== plugin);
++          if (text === null && others.length === snapshot.statuses.length) return snapshot;
++          return {
++            ...snapshot,
++            statuses: text === null ? others : [...others, { plugin, text }],
++          };
++        });
++      }
++      case "ui_toast": {
++        if (typeof message.plugin !== "string" || typeof message.text !== "string") {
++          return Effect.void;
++        }
++        const toast = {
++          id: typeof message.uuid === "string" ? message.uuid : `toast-${++toastCount}`,
++          plugin: message.plugin,
++          text: message.text,
++          timeoutMs: typeof message.timeout_ms === "number" ? message.timeout_ms : 4000,
++        };
++        return update(threadId, (snapshot) => ({ ...snapshot, toast }));
++      }
++      case "ui_invalidate":
++        return requestRender(threadId);
++      default:
++        return Effect.void;
++    }
++  };
++
++  const subscribe: ClaudePluginUiShape["subscribe"] = (threadId) =>
++    Stream.unwrap(
++      Effect.gen(function* () {
++        const subscription = yield* PubSub.subscribe(changes);
++        const latest = threads.get(threadId)?.snapshot ?? EMPTY_CLAUDE_PLUGIN_UI_SNAPSHOT;
++        return Stream.concat(
++          Stream.make(latest),
++          Stream.fromSubscription(subscription).pipe(
++            Stream.filter((change) => change.threadId === threadId),
++            Stream.map((change) => change.snapshot),
++          ),
++        );
++      }),
++    );
++
++  const press: ClaudePluginUiShape["press"] = (input) =>
++    Effect.suspend(() => {
++      const request = threads.get(input.threadId)?.request;
++      if (request === undefined) return Effect.void;
++      return Effect.tryPromise(() =>
++        request({
++          subtype: "ui_press",
++          plugin: input.plugin,
++          handle: input.handle,
++          surface: "desktop",
++          ...(input.key === undefined ? {} : { key: input.key }),
++        }),
++      ).pipe(
++        Effect.catchCause((cause) =>
++          Effect.logDebug("claude-plugin-ui.press-failed", { threadId: input.threadId, cause }),
++        ),
++        Effect.asVoid,
++      );
++    });
++
++  return ClaudePluginUi.of({ attach, detach, ingest, subscribe, press });
++});
++
++export const layer = Layer.effect(ClaudePluginUi, make);
+diff --git a/apps/server/src/provider/Layers/ProviderOrchestrationAdapterInfrastructure.ts b/apps/server/src/provider/Layers/ProviderOrchestrationAdapterInfrastructure.ts
+index c9d8d5e7..35743432 100644
+--- a/apps/server/src/provider/Layers/ProviderOrchestrationAdapterInfrastructure.ts
++++ b/apps/server/src/provider/Layers/ProviderOrchestrationAdapterInfrastructure.ts
+@@ -1,6 +1,7 @@
+ import * as Layer from "effect/Layer";
+ 
+ import * as ClaudeAdapterV2 from "../../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
++import * as ClaudePluginUi from "../ClaudePluginUi.ts";
+ import * as CodexAdapterV2 from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
+ import * as CursorAgentSdk from "../../orchestration-v2/Adapters/CursorAgentSdk.ts";
+ import * as IdAllocator from "../../orchestration-v2/IdAllocator.ts";
+@@ -19,7 +20,9 @@ export type ProviderOrchestrationAdapterInfrastructure =
+  * Effect layer memoization yields one shared queue.
+  */
+ export const ProviderOrchestrationAdapterInfrastructureLive = Layer.mergeAll(
+-  ClaudeAdapterV2.claudeAgentSdkQueryRunnerLiveLayer,
++  // Same `ClaudePluginUi.layer` reference the server provides, so memoization
++  // hands the runner and the websocket routes one shared instance.
++  ClaudeAdapterV2.claudeAgentSdkQueryRunnerLiveLayer.pipe(Layer.provide(ClaudePluginUi.layer)),
+   CodexAdapterV2.codexAppServerClientFactoryFromSettingsLayer,
+   CursorAgentSdk.cursorAgentSdkRunnerLiveLayer,
+   IdAllocator.layer,
+diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
+index 9e9d5c5e..863887e2 100644
+--- a/apps/server/src/server.ts
++++ b/apps/server/src/server.ts
+@@ -50,6 +50,7 @@ import * as ProviderEventIngestor from "./orchestration-v2/ProviderEventIngestor
+ import * as ModelManifest from "./provider/ModelManifest.ts";
+ import * as ResetCreditCoordinator from "./provider/Layers/resetCreditCoordinator.ts";
+ import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
++import * as ClaudePluginUi from "./provider/ClaudePluginUi.ts";
+ import * as OpenCodeRuntime from "./provider/opencodeRuntime.ts";
+ import * as OpenCodeServerLedger from "./provider/OpenCodeServerLedger.ts";
+ import { AcpRegistryCatalogLive } from "./provider/Layers/AcpRegistryCatalog.ts";
+@@ -583,7 +584,12 @@ const RuntimeCoreDependenciesLive = RuntimeCoreDependenciesBaseLive.pipe(
+   // from the repo's `model-manifest.json` on `main` and applied by the
+   // Codex/Claude drivers.
+   Layer.provideMerge(
+-    Layer.mergeAll(ProviderEventLoggers.layer, ModelManifest.layer, ResetCreditCoordinator.layer),
++    Layer.mergeAll(
++      ProviderEventLoggers.layer,
++      ModelManifest.layer,
++      ResetCreditCoordinator.layer,
++      ClaudePluginUi.layer,
++    ),
+   ),
+   // `OpenCodeDriver.create()` yields `OpenCodeRuntime`; previously the old
+   // `ProviderRegistryLive` pulled `OpenCodeRuntimeLive` in for itself, but
+diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
+index 7800603f..7798f02f 100644
+--- a/apps/server/src/ws.ts
++++ b/apps/server/src/ws.ts
+@@ -170,6 +170,7 @@ import * as ProviderMaintenance from "./provider/providerMaintenance.ts";
+ import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
+ import * as ProviderAuthService from "./provider/Services/ProviderAuthService.ts";
+ import { makeProviderInstallation } from "./provider/providerInstallation.ts";
++import * as ClaudePluginUi from "./provider/ClaudePluginUi.ts";
+ import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
+ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
+ import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
+@@ -1267,6 +1268,7 @@ const makeWsRpcLayer = (
+       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
+       const providerAuth = yield* ProviderAuthService.ProviderAuthService;
+       const providerInstallation = yield* makeProviderInstallation();
++      const claudePluginUi = yield* ClaudePluginUi.ClaudePluginUi;
+       const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
+       const config = yield* ServerConfig.ServerConfig;
+       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
+@@ -2490,6 +2492,16 @@ const makeWsRpcLayer = (
+             providerInstallation.subscribe(input),
+             { "rpc.aggregate": "provider" },
+           ),
++        [WS_METHODS.claudePluginUiSubscribe]: (input) =>
++          observeRpcStream(
++            WS_METHODS.claudePluginUiSubscribe,
++            claudePluginUi.subscribe(input.threadId),
++            { "rpc.aggregate": "provider" },
++          ),
++        [WS_METHODS.claudePluginUiPress]: (input) =>
++          observeRpcEffect(WS_METHODS.claudePluginUiPress, claudePluginUi.press(input), {
++            "rpc.aggregate": "provider",
++          }),
+         [WS_METHODS.providerInstallRemove]: (input) =>
+           observeRpcEffect(WS_METHODS.providerInstallRemove, providerInstallation.remove(input), {
+             "rpc.aggregate": "provider",
+diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
+index ec924e2c..13d394e4 100644
+--- a/apps/web/src/components/ChatView.tsx
++++ b/apps/web/src/components/ChatView.tsx
+@@ -418,6 +418,7 @@ import {
+ } from "../state/entities";
+ import { environmentShell } from "../state/shell";
+ import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
++import { ClaudePluginUiBand } from "./chat/ClaudePluginUiBand";
+ import { createPageScrollController, type PageScrollKey } from "./chat/pageScrollController";
+ import { isTimelineScrollTarget } from "./chat/timelineScrollTarget";
+ import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
+@@ -11127,6 +11128,9 @@ export default function ChatView(props: ChatViewProps) {
+                               }
+                             />
+                           ) : null}
++                          {!composerMounted || routeKind === "draft" ? null : (
++                            <ClaudePluginUiBand environmentId={environmentId} threadId={threadId} />
++                          )}
+                           {!composerMounted ? null : (
+                             <ChatComposer
+                               reportedModelSelection={reportedModelSelection}
+diff --git a/apps/web/src/components/chat/ClaudePluginUiBand.tsx b/apps/web/src/components/chat/ClaudePluginUiBand.tsx
+new file mode 100644
+index 00000000..d09ac0ec
+--- /dev/null
++++ b/apps/web/src/components/chat/ClaudePluginUiBand.tsx
+@@ -0,0 +1,292 @@
++import type {
++  ClaudePluginUiChild,
++  ClaudePluginUiElement,
++  EnvironmentId,
++  ThreadId,
++} from "@t3tools/contracts";
++import { type CSSProperties, type ReactNode, useEffect, useRef } from "react";
++
++import { useEnvironmentQuery } from "../../state/query";
++import { serverEnvironment } from "../../state/server";
++import { useAtomCommand } from "../../state/use-atom-command";
++import { toastManager } from "../ui/toast";
++
++/**
++ * Draws what Claude Code plugins put on screen for this thread: the band a
++ * plugin's `ui.render` hook draws above the prompt, its `$.ui.status` lines
++ * and its `$.ui.toast` notices. Plugins lay out in terminal cells, so the
++ * band is monospace and sizes in `ch`.
++ */
++export function ClaudePluginUiBand(props: {
++  readonly environmentId: EnvironmentId;
++  readonly threadId: ThreadId;
++}) {
++  const { environmentId, threadId } = props;
++  const snapshot = useEnvironmentQuery(
++    serverEnvironment.claudePluginUi({ environmentId, input: { threadId } }),
++  ).data;
++  const pressCommand = useAtomCommand(serverEnvironment.pressClaudePluginUi, {
++    reportFailure: false,
++    reportDefect: false,
++  });
++  // `undefined` until the first snapshot lands; a toast already in it is stale.
++  const shownToastId = useRef<string | null | undefined>(undefined);
++  const hasSnapshot = snapshot !== null;
++  const toast = snapshot?.toast ?? null;
++
++  useEffect(() => {
++    if (!hasSnapshot) return;
++    if (shownToastId.current === undefined) {
++      shownToastId.current = toast?.id ?? null;
++      return;
++    }
++    if (toast === null || shownToastId.current === toast.id) return;
++    shownToastId.current = toast.id;
++    toastManager.add({
++      type: "info",
++      title: toast.plugin,
++      description: toast.text,
++      timeout: toast.timeoutMs,
++    });
++  }, [hasSnapshot, toast]);
++
++  if (snapshot === null || (snapshot.band === null && snapshot.statuses.length === 0)) {
++    return null;
++  }
++
++  const press = (target: { plugin: string; handle: number }, key: string | undefined) => {
++    void pressCommand({
++      environmentId,
++      input: { threadId, ...target, ...(key === undefined ? {} : { key }) },
++    });
++  };
++
++  return (
++    <div className="mx-auto mb-1.5 flex w-full max-w-208 flex-col gap-1 px-1 font-mono text-xs leading-tight">
++      {snapshot.band === null ? null : (
++        <div className="overflow-x-auto rounded-md border border-border/60 bg-muted/30 px-2 py-1.5 leading-none">
++          {renderNode(snapshot.band, "band", press)}
++        </div>
++      )}
++      {snapshot.statuses.length === 0 ? null : (
++        <div className="flex flex-wrap gap-x-3 gap-y-0.5 px-1 text-muted-foreground">
++          {snapshot.statuses.map((status) => (
++            <span key={status.plugin} className="whitespace-pre">
++              {status.text}
++            </span>
++          ))}
++        </div>
++      )}
++    </div>
++  );
++}
++
++type Press = (target: { plugin: string; handle: number }, key: string | undefined) => void;
++
++const cells = (value: unknown): string | undefined =>
++  typeof value === "number" ? `${value}ch` : typeof value === "string" ? value : undefined;
++
++const lines = (value: unknown): string | undefined =>
++  typeof value === "number" ? `${value * 1.25}em` : typeof value === "string" ? value : undefined;
++
++/** Ink-style color names and hex pass through; `ansi256(n)` has no CSS twin and is dropped. */
++const color = (value: unknown): string | undefined =>
++  typeof value === "string" && !value.startsWith("ansi") ? value : undefined;
++
++function boxStyle(props: Readonly<Record<string, unknown>>): CSSProperties {
++  const style: CSSProperties = {
++    display: props.display === "none" ? "none" : "flex",
++    flexDirection: (props.flexDirection as CSSProperties["flexDirection"]) ?? "row",
++  };
++  const set = <K extends keyof CSSProperties>(key: K, value: CSSProperties[K] | undefined) => {
++    if (value !== undefined) style[key] = value;
++  };
++  set("gap", cells(props.gap));
++  set("columnGap", cells(props.columnGap));
++  set("rowGap", lines(props.rowGap));
++  set(
++    "padding",
++    props.padding === undefined ? undefined : `${lines(props.padding)} ${cells(props.padding)}`,
++  );
++  set("paddingLeft", cells(props.paddingLeft ?? props.paddingX));
++  set("paddingRight", cells(props.paddingRight ?? props.paddingX));
++  set("paddingTop", lines(props.paddingTop ?? props.paddingY));
++  set("paddingBottom", lines(props.paddingBottom ?? props.paddingY));
++  set("marginLeft", cells(props.marginLeft ?? props.marginX));
++  set("marginRight", cells(props.marginRight ?? props.marginX));
++  set("marginTop", lines(props.marginTop ?? props.marginY));
++  set("marginBottom", lines(props.marginBottom ?? props.marginY));
++  set("width", cells(props.width));
++  set("minWidth", cells(props.minWidth));
++  set("height", lines(props.height));
++  set("flexGrow", typeof props.flexGrow === "number" ? props.flexGrow : undefined);
++  set("flexShrink", typeof props.flexShrink === "number" ? props.flexShrink : undefined);
++  set("flexWrap", props.flexWrap as CSSProperties["flexWrap"]);
++  set("alignItems", props.alignItems as CSSProperties["alignItems"]);
++  set("justifyContent", props.justifyContent as CSSProperties["justifyContent"]);
++  set("backgroundColor", color(props.backgroundColor));
++  if (typeof props.borderStyle === "string") {
++    style.border = `1px ${props.borderStyle === "double" ? "double" : "solid"} ${
++      color(props.borderColor) ?? "var(--border)"
++    }`;
++    style.borderRadius = props.borderStyle === "round" ? "0.375rem" : undefined;
++    style.padding ??= "0 1ch";
++  }
++  return style;
++}
++
++function textStyle(props: Readonly<Record<string, unknown>>): CSSProperties {
++  const inverse = props.inverse === true;
++  const fg = color(props.color);
++  const bg = color(props.backgroundColor);
++  const decorations = [
++    props.underline === true ? "underline" : null,
++    props.strikethrough === true ? "line-through" : null,
++  ].filter((decoration) => decoration !== null);
++  return {
++    // Ink wraps Text by default; the `truncate*` modes cut it to one line.
++    ...(typeof props.wrap === "string" && props.wrap.startsWith("truncate")
++      ? { whiteSpace: "pre", overflow: "hidden", textOverflow: "ellipsis" }
++      : { whiteSpace: "pre-wrap" }),
++    ...(fg === undefined && !inverse ? {} : { color: inverse ? (bg ?? "var(--background)") : fg }),
++    ...(bg === undefined && !inverse
++      ? {}
++      : { backgroundColor: inverse ? (fg ?? "var(--foreground)") : bg }),
++    ...(props.bold === true ? { fontWeight: 600 } : {}),
++    ...(props.italic === true ? { fontStyle: "italic" } : {}),
++    ...(props.dimColor === true ? { opacity: 0.6 } : {}),
++    ...(decorations.length === 0 ? {} : { textDecoration: decorations.join(" ") }),
++  };
++}
++
++/** Text styling a plugin may set on a div/span/b; layout and positioning stay ours. */
++const ALLOWED_DECLARATIONS = new Set([
++  "color",
++  "backgroundColor",
++  "fontWeight",
++  "fontStyle",
++  "textDecoration",
++  "opacity",
++  "whiteSpace",
++]);
++
++/** Parses the `style` declaration string a plugin put on a div/span/b. */
++function declarations(value: unknown): CSSProperties {
++  if (typeof value !== "string") return {};
++  const style: Record<string, string> = {};
++  for (const declaration of value.split(";")) {
++    const separator = declaration.indexOf(":");
++    if (separator <= 0) continue;
++    const property = declaration
++      .slice(0, separator)
++      .trim()
++      .replace(/-([a-z])/g, (_, letter: string) => letter.toUpperCase());
++    const propertyValue = declaration.slice(separator + 1).trim();
++    if (!ALLOWED_DECLARATIONS.has(property) || /url\(/i.test(propertyValue)) continue;
++    style[property] = propertyValue;
++  }
++  return style as CSSProperties;
++}
++
++/** Only web links open from a plugin's tree. */
++function safeHref(value: unknown): string | undefined {
++  if (typeof value !== "string") return undefined;
++  try {
++    const url = new URL(value);
++    return url.protocol === "https:" || url.protocol === "http:" ? url.href : undefined;
++  } catch {
++    return undefined;
++  }
++}
++
++function renderChildren(
++  children: ReadonlyArray<ClaudePluginUiChild> | undefined,
++  path: string,
++  press: Press,
++): ReactNode {
++  // A plugin's tree is positional: its children carry no ids of their own.
++  return children?.map((child, index) =>
++    typeof child === "string" ? (
++      // oxlint-disable-next-line react/no-array-index-key
++      <span key={`${path}.${index}`} className="whitespace-pre-wrap">
++        {child}
++      </span>
++    ) : (
++      renderNode(child, `${path}.${index}`, press)
++    ),
++  );
++}
++
++function renderNode(node: ClaudePluginUiElement, path: string, press: Press): ReactNode {
++  const props = node.props ?? {};
++  const key = typeof props.key === "string" ? props.key : path;
++  switch (node.type) {
++    case "Box":
++      return (
++        <div key={key} style={boxStyle(props)}>
++          {renderChildren(node.children, path, press)}
++        </div>
++      );
++    case "Text":
++      return (
++        <span key={key} style={textStyle(props)}>
++          {renderChildren(node.children, path, press)}
++        </span>
++      );
++    case "div":
++    case "span":
++    case "b": {
++      const Tag = node.type;
++      return (
++        <Tag key={key} style={declarations(props.style)}>
++          {renderChildren(node.children, path, press)}
++        </Tag>
++      );
++    }
++    case "Button": {
++      const label = typeof props.label === "string" ? props.label : "";
++      const target = node.press;
++      return (
++        <button
++          key={key}
++          type="button"
++          disabled={target === undefined}
++          onClick={() =>
++            target && press(target, typeof props.key === "string" ? props.key : undefined)
++          }
++          className={
++            props.plain === true
++              ? "whitespace-pre hover:underline"
++              : props.variant === "primary"
++                ? "whitespace-pre rounded bg-primary px-1.5 text-primary-foreground hover:bg-primary/90"
++                : "whitespace-pre rounded border border-border px-1.5 hover:bg-accent"
++          }
++          style={props.dimColor === true ? { opacity: 0.6 } : undefined}
++        >
++          {label}
++        </button>
++      );
++    }
++    case "Link": {
++      const href = safeHref(props.href);
++      return (
++        <a key={key} href={href} target="_blank" rel="noreferrer" className="underline">
++          {typeof props.label === "string" ? props.label : href}
++          {renderChildren(node.children, path, press)}
++        </a>
++      );
++    }
++    case "Code":
++    case "Markdown": {
++      const source = typeof props.source === "string" ? props.source : null;
++      return (
++        <span key={key} className="whitespace-pre-wrap">
++          {source ?? renderChildren(node.children, path, press)}
++        </span>
++      );
++    }
++    default:
++      // Input, Select, Svg, Client: not drawn on this surface yet.
++      return null;
++  }
++}
+diff --git a/packages/client-runtime/src/rpc/client.ts b/packages/client-runtime/src/rpc/client.ts
+index 4ce45cf3..c4c5fd7b 100644
+--- a/packages/client-runtime/src/rpc/client.ts
++++ b/packages/client-runtime/src/rpc/client.ts
+@@ -48,6 +48,7 @@ export type EnvironmentSubscriptionRpcTag =
+   | typeof WS_METHODS.codexAuthCallbackSubscribe
+   | typeof WS_METHODS.providerAuthSubscribe
+   | typeof WS_METHODS.providerInstallSubscribe
++  | typeof WS_METHODS.claudePluginUiSubscribe
+   | typeof ORCHESTRATION_V2_WS_METHODS.subscribeShell
+   | typeof ORCHESTRATION_V2_WS_METHODS.subscribeThread
+   | typeof WS_METHODS.subscribeAuthAccess
+diff --git a/packages/client-runtime/src/state/server.ts b/packages/client-runtime/src/state/server.ts
+index 5f181839..ac6d965d 100644
+--- a/packages/client-runtime/src/state/server.ts
++++ b/packages/client-runtime/src/state/server.ts
+@@ -1057,6 +1057,15 @@ export function createServerEnvironmentAtoms<R, E>(
+       label: "environment-data:provider:install-remove",
+       tag: WS_METHODS.providerInstallRemove,
+     }),
++    claudePluginUi: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
++      label: "environment-data:provider:claude-plugin-ui",
++      tag: WS_METHODS.claudePluginUiSubscribe,
++      idleTtlMs: 0,
++    }),
++    pressClaudePluginUi: createEnvironmentRpcCommand(runtime, {
++      label: "environment-data:provider:claude-plugin-ui-press",
++      tag: WS_METHODS.claudePluginUiPress,
++    }),
+     traceDiagnostics: createEnvironmentRpcQueryAtomFamily(runtime, {
+       label: "environment-data:server:trace-diagnostics",
+       tag: WS_METHODS.serverGetTraceDiagnostics,
+diff --git a/packages/contracts/src/claudePluginUi.ts b/packages/contracts/src/claudePluginUi.ts
+new file mode 100644
+index 00000000..f6b7edec
+--- /dev/null
++++ b/packages/contracts/src/claudePluginUi.ts
+@@ -0,0 +1,85 @@
++import * as Schema from "effect/Schema";
++
++import { ThreadId } from "./baseSchemas.ts";
++
++/**
++ * UI that Claude Code plugins draw for a headless session: `$.ui.status`
++ * lines, `$.ui.toast` notices and the `AbovePrompt` band a `ui.render` hook
++ * returns. The Claude CLI streams these as `ui_*` messages; the server keeps
++ * the latest per thread and clients draw it. Nothing here is persisted.
++ */
++
++/** Where an element's handler lives, as the CLI stamped it. A press names it back. */
++export const ClaudePluginUiPressTarget = Schema.Struct({
++  plugin: Schema.String,
++  handle: Schema.Number,
++});
++export type ClaudePluginUiPressTarget = typeof ClaudePluginUiPressTarget.Type;
++
++export interface ClaudePluginUiElement {
++  readonly type: string;
++  readonly props?: { readonly [key: string]: unknown };
++  readonly press?: ClaudePluginUiPressTarget;
++  readonly children?: ReadonlyArray<ClaudePluginUiChild>;
++}
++export type ClaudePluginUiChild = string | ClaudePluginUiElement;
++
++/**
++ * One node of a plugin's render tree. Kept loose on purpose: the CLI already
++ * validated it against the desktop element table, and clients draw the types
++ * they know and skip the rest.
++ */
++export const ClaudePluginUiElement: Schema.Codec<ClaudePluginUiElement> = Schema.Struct({
++  type: Schema.String,
++  props: Schema.optionalKey(Schema.Record(Schema.String, Schema.Unknown)),
++  press: Schema.optionalKey(ClaudePluginUiPressTarget),
++  children: Schema.optionalKey(
++    Schema.Array(
++      Schema.Union([
++        Schema.String,
++        Schema.suspend((): Schema.Codec<ClaudePluginUiElement> => ClaudePluginUiElement),
++      ]),
++    ),
++  ),
++});
++
++export const ClaudePluginUiStatus = Schema.Struct({
++  plugin: Schema.String,
++  text: Schema.String,
++});
++export type ClaudePluginUiStatus = typeof ClaudePluginUiStatus.Type;
++
++export const ClaudePluginUiToast = Schema.Struct({
++  id: Schema.String,
++  plugin: Schema.String,
++  text: Schema.String,
++  timeoutMs: Schema.Number,
++});
++export type ClaudePluginUiToast = typeof ClaudePluginUiToast.Type;
++
++export const ClaudePluginUiSnapshot = Schema.Struct({
++  statuses: Schema.Array(ClaudePluginUiStatus),
++  band: Schema.NullOr(ClaudePluginUiElement),
++  /** The latest toast; clients show each `id` once. */
++  toast: Schema.NullOr(ClaudePluginUiToast),
++});
++export type ClaudePluginUiSnapshot = typeof ClaudePluginUiSnapshot.Type;
++
++export const ClaudePluginUiSubscribeInput = Schema.Struct({
++  threadId: ThreadId,
++});
++export type ClaudePluginUiSubscribeInput = typeof ClaudePluginUiSubscribeInput.Type;
++
++export const ClaudePluginUiPressInput = Schema.Struct({
++  threadId: ThreadId,
++  plugin: Schema.String,
++  handle: Schema.Number,
++  key: Schema.optionalKey(Schema.String),
++});
++export type ClaudePluginUiPressInput = typeof ClaudePluginUiPressInput.Type;
++
++export const EMPTY_CLAUDE_PLUGIN_UI_SNAPSHOT: ClaudePluginUiSnapshot = {
++  statuses: [],
++  band: null,
++  toast: null,
++};
+diff --git a/packages/contracts/src/index.ts b/packages/contracts/src/index.ts
+index 8690bb1b..1ee55285 100644
+--- a/packages/contracts/src/index.ts
++++ b/packages/contracts/src/index.ts
+@@ -18,6 +18,7 @@ export * from "./providerInstance.ts";
+ export * from "./providerSetup.ts";
+ export * from "./providerRuntime.ts";
+ export * from "./providerUsageLimits.ts";
++export * from "./claudePluginUi.ts";
+ export * from "./usageLimitSourceId.ts";
+ export * from "./providerPolicy.ts";
+ export * from "./modelSelection.ts";
+diff --git a/packages/contracts/src/rpc.ts b/packages/contracts/src/rpc.ts
+index 9fb0f186..62511457 100644
+--- a/packages/contracts/src/rpc.ts
++++ b/packages/contracts/src/rpc.ts
+@@ -6,6 +6,11 @@ import {
+   ChatGptHandoffInput,
+   ChatGptHandoffState,
+ } from "./providerSetup.ts";
++import {
++  ClaudePluginUiPressInput,
++  ClaudePluginUiSnapshot,
++  ClaudePluginUiSubscribeInput,
++} from "./claudePluginUi.ts";
+ import * as Schema from "effect/Schema";
+ import * as Rpc from "effect/unstable/rpc/Rpc";
+ import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
+@@ -379,6 +384,8 @@ export const WS_METHODS = {
+   providerInstallCancel: "provider.install.cancel",
+   providerInstallSubscribe: "provider.install.subscribe",
+   providerInstallRemove: "provider.install.remove",
++  claudePluginUiSubscribe: "provider.claude.plugin-ui.subscribe",
++  claudePluginUiPress: "provider.claude.plugin-ui.press",
+ 
+   // VCS methods
+   vcsPull: "vcs.pull",
+@@ -673,6 +680,18 @@ const WsProviderInstallSubscribeRpc = Rpc.make(WS_METHODS.providerInstallSubscri
+   stream: true,
+ });
+ 
++const WsClaudePluginUiSubscribeRpc = Rpc.make(WS_METHODS.claudePluginUiSubscribe, {
++  payload: ClaudePluginUiSubscribeInput,
++  success: ClaudePluginUiSnapshot,
++  error: EnvironmentAuthorizationError,
++  stream: true,
++});
++
++const WsClaudePluginUiPressRpc = Rpc.make(WS_METHODS.claudePluginUiPress, {
++  payload: ClaudePluginUiPressInput,
++  error: EnvironmentAuthorizationError,
++});
++
+ const WsProviderInstallRemoveRpc = Rpc.make(WS_METHODS.providerInstallRemove, {
+   payload: ProviderSetupInput,
+   success: ProviderInstallState,
+@@ -1718,6 +1737,8 @@ export const WsRpcGroup = RpcGroup.make(
+   WsProviderInstallStartRpc,
+   WsProviderInstallCancelRpc,
+   WsProviderInstallSubscribeRpc,
++  WsClaudePluginUiSubscribeRpc,
++  WsClaudePluginUiPressRpc,
+   WsProviderInstallRemoveRpc,
+   WsServerUpdateServerRpc,
+   WsServerUpdateServerWithProgressRpc,
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 27fedfde3193f3991d004d0cc6dbb2d2ca854464 Mon Sep 17 00:00:00 2001
+From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
+Date: Sun, 4 Oct 2026 21:25:06 -0500
+Subject: [PATCH 2/2] fix(claude): draw plugin block art without seams and fit
+ the band's width
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Block elements (█ ▀ ▄ ▙ ▟ …) drew as font glyphs, whose anti-aliased edges
+striped plugin pixel art. They now draw as painted boxes, full and half
+block runs as one box, each overlapping its neighbours by half a pixel.
+
+The band asks plugins for 100 columns instead of 80, so three-column
+layouts no longer run into each other, and its font shrinks to fit when
+the composer is narrower than that.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/server/src/provider/ClaudePluginUi.ts    |   4 +-
+ .../components/chat/ClaudePluginUiBand.tsx    | 125 +++++++++++++++---
+ packages/contracts/src/claudePluginUi.ts      |   6 +
+ 3 files changed, 118 insertions(+), 17 deletions(-)
+
+diff --git a/apps/server/src/provider/ClaudePluginUi.ts b/apps/server/src/provider/ClaudePluginUi.ts
+index cbf9267f..d8dc29f5 100644
+--- a/apps/server/src/provider/ClaudePluginUi.ts
++++ b/apps/server/src/provider/ClaudePluginUi.ts
+@@ -14,6 +14,7 @@
+  * leaves the thread without plugin UI; it never affects a turn.
+  */
+ import {
++  CLAUDE_PLUGIN_UI_BAND_COLUMNS,
+   type ClaudePluginUiElement,
+   type ClaudePluginUiPressInput,
+   type ClaudePluginUiSnapshot,
+@@ -31,7 +32,6 @@ export type ClaudeControlRequest = (request: Record<string, unknown>) => Promise
+ 
+ const BAND_INSTANCE_ID = "above-prompt";
+ const BAND_MAX_ROWS = 12;
+-const BAND_COLUMNS = 80;
+ 
+ interface ThreadEntry {
+   request: ClaudeControlRequest | undefined;
+@@ -115,7 +115,7 @@ export const make = Effect.gen(function* () {
+           hasSurvey: false,
+           isWorking: false,
+           maxRows: BAND_MAX_ROWS,
+-          bodyColumns: BAND_COLUMNS,
++          bodyColumns: CLAUDE_PLUGIN_UI_BAND_COLUMNS,
+           scroll: { offset: 0, bodyRows: BAND_MAX_ROWS },
+         },
+       }),
+diff --git a/apps/web/src/components/chat/ClaudePluginUiBand.tsx b/apps/web/src/components/chat/ClaudePluginUiBand.tsx
+index d09ac0ec..c573e2b1 100644
+--- a/apps/web/src/components/chat/ClaudePluginUiBand.tsx
++++ b/apps/web/src/components/chat/ClaudePluginUiBand.tsx
+@@ -1,8 +1,9 @@
+-import type {
+-  ClaudePluginUiChild,
+-  ClaudePluginUiElement,
+-  EnvironmentId,
+-  ThreadId,
++import {
++  CLAUDE_PLUGIN_UI_BAND_COLUMNS,
++  type ClaudePluginUiChild,
++  type ClaudePluginUiElement,
++  type EnvironmentId,
++  type ThreadId,
+ } from "@t3tools/contracts";
+ import { type CSSProperties, type ReactNode, useEffect, useRef } from "react";
+ 
+@@ -64,8 +65,15 @@ export function ClaudePluginUiBand(props: {
+   return (
+     <div className="mx-auto mb-1.5 flex w-full max-w-208 flex-col gap-1 px-1 font-mono text-xs leading-tight">
+       {snapshot.band === null ? null : (
+-        <div className="overflow-x-auto rounded-md border border-border/60 bg-muted/30 px-2 py-1.5 leading-none">
+-          {renderNode(snapshot.band, "band", press)}
++        <div className="overflow-x-auto rounded-md border border-border/60 bg-muted/30 px-2 py-1.5 leading-none [container-type:inline-size]">
++          {/* Shrink below text-xs when the composer is narrower than the plugin's columns. */}
++          <div
++            style={{
++              fontSize: `min(0.75rem, calc(100cqi / ${CLAUDE_PLUGIN_UI_BAND_COLUMNS * MONO_CH_EM}))`,
++            }}
++          >
++            {renderNode(snapshot.band, "band", press)}
++          </div>
+         </div>
+       )}
+       {snapshot.statuses.length === 0 ? null : (
+@@ -199,6 +207,98 @@ function safeHref(value: unknown): string | undefined {
+   }
+ }
+ 
++/** Width of one monospace cell in em (SF Mono and Menlo are 0.6). */
++const MONO_CH_EM = 0.6;
++
++// Block elements drawn as shapes, not glyphs: a font's block glyphs leave
++// anti-aliased seams between cells, which stripes plugin pixel art.
++// Quadrant bits: 8 top-left, 4 top-right, 2 bottom-left, 1 bottom-right.
++const BLOCK_QUADRANTS: Readonly<Record<string, number>> = {
++  "█": 15,
++  "▀": 12,
++  "▄": 3,
++  "▌": 10,
++  "▐": 5,
++  "▘": 8,
++  "▝": 4,
++  "▖": 2,
++  "▗": 1,
++  "▙": 11,
++  "▛": 14,
++  "▜": 13,
++  "▟": 7,
++  "▚": 9,
++  "▞": 6,
++};
++const QUADRANT_POSITIONS: ReadonlyArray<readonly [number, string]> = [
++  [8, "0 0"],
++  [4, "100% 0"],
++  [2, "0 100%"],
++  [1, "100% 100%"],
++];
++const SOLID = "linear-gradient(currentColor, currentColor)";
++
++/**
++ * One block element, or a run of `count` identical full or half blocks, as a
++ * painted box. Boxes overlap their right and bottom neighbours by half a pixel
++ * so fractional cell edges never leave a seam.
++ */
++function blockStyle(mask: number, count: number): CSSProperties {
++  const layers = QUADRANT_POSITIONS.filter(([bit]) => (mask & bit) !== 0);
++  const half = "calc(50% + 0.5px)";
++  return {
++    display: "inline-block",
++    width: `calc(${count}ch + 0.5px)`,
++    marginRight: "-0.5px",
++    height: "calc(1lh + 0.5px)",
++    marginBottom: "-0.5px",
++    verticalAlign: "top",
++    backgroundImage: layers.map(() => SOLID).join(", "),
++    backgroundPosition: layers.map(([, position]) => position).join(", "),
++    backgroundSize: count === 1 ? `${half} ${half}` : mask === 15 ? "100% 100%" : `100% ${half}`,
++    backgroundRepeat: "no-repeat",
++  };
++}
++
++/** Full and half blocks look the same at any width, so their runs draw as one box. */
++const MERGEABLE_MASKS = new Set([15, 12, 3]);
++
++function renderText(text: string, key: string): ReactNode {
++  const chars = [...text];
++  if (!chars.some((char) => char in BLOCK_QUADRANTS)) {
++    return (
++      <span key={key} className="whitespace-pre-wrap">
++        {text}
++      </span>
++    );
++  }
++  const parts: ReactNode[] = [];
++  let plain = "";
++  for (let index = 0; index < chars.length;) {
++    const char = chars[index] as string;
++    const mask = BLOCK_QUADRANTS[char];
++    if (mask === undefined) {
++      plain += char;
++      index += 1;
++      continue;
++    }
++    if (plain !== "") {
++      parts.push(plain);
++      plain = "";
++    }
++    let count = 1;
++    if (MERGEABLE_MASKS.has(mask)) while (chars[index + count] === char) count += 1;
++    parts.push(<span key={index} aria-hidden style={blockStyle(mask, count)} />);
++    index += count;
++  }
++  if (plain !== "") parts.push(plain);
++  return (
++    <span key={key} className="whitespace-pre">
++      {parts}
++    </span>
++  );
++}
++
+ function renderChildren(
+   children: ReadonlyArray<ClaudePluginUiChild> | undefined,
+   path: string,
+@@ -206,14 +306,9 @@ function renderChildren(
+ ): ReactNode {
+   // A plugin's tree is positional: its children carry no ids of their own.
+   return children?.map((child, index) =>
+-    typeof child === "string" ? (
+-      // oxlint-disable-next-line react/no-array-index-key
+-      <span key={`${path}.${index}`} className="whitespace-pre-wrap">
+-        {child}
+-      </span>
+-    ) : (
+-      renderNode(child, `${path}.${index}`, press)
+-    ),
++    typeof child === "string"
++      ? renderText(child, `${path}.${index}`)
++      : renderNode(child, `${path}.${index}`, press),
+   );
+ }
+ 
+diff --git a/packages/contracts/src/claudePluginUi.ts b/packages/contracts/src/claudePluginUi.ts
+index f6b7edec..d5014346 100644
+--- a/packages/contracts/src/claudePluginUi.ts
++++ b/packages/contracts/src/claudePluginUi.ts
+@@ -78,6 +78,12 @@ export const ClaudePluginUiPressInput = Schema.Struct({
+ });
+ export type ClaudePluginUiPressInput = typeof ClaudePluginUiPressInput.Type;
+ 
++/**
++ * Terminal columns the band is laid out for. The server asks plugins to fit
++ * this width; clients scale the font so it fits theirs.
++ */
++export const CLAUDE_PLUGIN_UI_BAND_COLUMNS = 100;
++
+ export const EMPTY_CLAUDE_PLUGIN_UI_SNAPSHOT: ClaudePluginUiSnapshot = {
+   statuses: [],
+   band: null,
+-- 
+2.50.1 (Apple Git-155)
+

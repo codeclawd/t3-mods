@@ -20,7 +20,7 @@ Give your agent this repo and say:
 You need Node.js 24 or newer, git (`xcode-select --install`), and T3 Code in `/Applications`.
 
 ```sh
-git clone https://github.com/<you>/t3-mods.git ~/t3-mods
+git clone https://github.com/codeclawd/t3-mods.git ~/t3-mods
 ~/t3-mods/bin/t3-mods install          # Nightly; add --app "/Applications/T3 Code (Alpha).app" for another build
 ~/t3-mods/bin/t3-mods apply            # quits T3, patches, reopens it; don't reopen it yourself
 ```
@@ -50,22 +50,24 @@ The band appears once the thread's first prompt starts its Claude session.
 
 ## Add your own T3 patches
 
-`T3_PATCHES` in `~/.t3-mods/config.env` lists git branches, applied in order on top of the exact T3
-release you run:
+The T3 change ships in this repo as `patches/claude-plugin-ui.patch`, so you don't need a fork of
+T3. `T3_PATCHES` in `~/.t3-mods/config.env` lists what to apply, in order, on top of the exact T3
+release you run. An entry is a `.patch` file (from `git format-patch`, path relative to this repo or
+absolute, no spaces) or a git branch written `<git url>#<branch>`:
 
 ```sh
-T3_PATCHES="https://github.com/codeclawd/t3code.git#feat/claude-plugin-ui https://github.com/you/t3code.git#my-fix"
+T3_PATCHES="patches/claude-plugin-ui.patch /Users/you/my-fix.patch https://github.com/you/t3code.git#another-fix"
 ```
 
-t3-mods applies each branch's own commits and skips any that T3 has already merged. If a branch
-stops applying to a new T3 release, you get a notification and T3 runs unpatched until the branch
-is rebased.
+t3-mods applies patch files with a 3-way `git am` and skips a patch the release already contains. It
+applies a branch's own commits and skips any T3 has merged. If something stops applying to a new
+T3 release, you get a notification and T3 runs unpatched until you update that patch.
 
 ## How it works
 
 1. A launchd agent (`com.t3-mods.agent`) runs every 15 seconds and whenever T3's updater replaces
    the app.
-2. For a new T3 version it checks out the matching release tag, applies your patch branches, and
+2. For a new T3 version it checks out the matching release tag, applies your patches, and
    builds T3's server and web client (about 40 seconds).
 3. Once T3 is closed it saves a copy of the official app, points the app's `apps/server/dist` at
    the build by editing the `app.asar` header, and re-signs the app ad hoc.
@@ -99,6 +101,7 @@ releases. After an update the agent builds again and tells you to quit T3 once.
 | `lib/asar-patch.mjs` | Rewrites the asar header so `apps/server/dist` reads from `app.asar.unpacked` |
 | `lib/entitlements.plist` | The entitlements the ad-hoc signature keeps |
 | `launchd/agent.plist` | Agent template |
+| `patches/claude-plugin-ui.patch` | The T3 change that draws plugin UI (two commits, `git format-patch`) |
 | `config.example.env` | Default config |
 
 ## License

@@ -85,12 +85,26 @@ due_request() {
   echo "$action"
 }
 
-# Patch heads, refreshed from their remotes at most every FETCH_EVERY_SECONDS.
+# A patch entry is a .patch file (relative to the repo or absolute) or <git url>#<branch>.
+patch_file() {
+  case "$1" in
+    *.patch) case "$1" in /*) echo "$1" ;; *) echo "$REPO_DIR/$1" ;; esac ;;
+    *) return 1 ;;
+  esac
+}
+
+# What to apply, one per line: patch files as their paths, branches as local
+# refs refreshed from their remotes at most every FETCH_EVERY_SECONDS.
 patch_refs() {
-  local i=0 stamp="$T3MODS_HOME/.fetched" now; now="$(date +%s)"
+  local i=0 stamp="$T3MODS_HOME/.fetched" now file; now="$(date +%s)"
   local fresh=0
   [ -f "$stamp" ] && [ $((now - $(cat "$stamp"))) -lt "$FETCH_EVERY_SECONDS" ] && fresh=1
   for entry in $T3_PATCHES; do
+    if file="$(patch_file "$entry")"; then
+      [ -f "$file" ] || die "patch file not found: $file"
+      echo "$file"
+      continue
+    fi
     i=$((i + 1))
     if [ "$fresh" = 0 ] || ! git -C "$CLONE" rev-parse -q --verify "refs/t3mods/patch$i" >/dev/null; then
       git -C "$CLONE" fetch -q "${entry%%#*}" "+refs/heads/${entry#*#}:refs/t3mods/patch$i"
@@ -109,6 +123,17 @@ build() {
   git reset -q --hard && git checkout -q --detach -f "v$version" || return 1
   local applied=0 earlier="" ref commit wanted
   for ref in $refs; do
+    if [ -f "$ref" ]; then
+      # A patch file: skip it when the release already contains it (it reverses cleanly).
+      if git apply --reverse --check "$ref" 2>/dev/null; then continue; fi
+      if ! git -c user.name=t3-mods -c user.email=t3-mods@localhost am -q -3 "$ref" >/dev/null 2>&1; then
+        git am --abort 2>/dev/null || true
+        log "$(basename "$ref") does not apply to v$version; left T3 as it is"
+        return 2
+      fi
+      applied=$((applied + 1))
+      continue
+    fi
     # This branch's own commits (not upstream's, not an earlier patch's), oldest
     # first, keeping only those `git cherry` finds missing from the release.
     wanted=" $(git cherry "v$version" "$ref" | awk '$1 == "+" { printf "%s ", $2 }')"
@@ -220,7 +245,9 @@ tick() {
 
   local version; version="$(plist_value CFBundleShortVersionString)"
   local refs; refs="$(patch_refs | tr '\n' ' ')"
-  local heads r; heads="$(for r in $refs; do git -C "$CLONE" rev-parse --short=12 "$r"; done | paste -sd+ -)"
+  local heads r; heads="$(for r in $refs; do
+    if [ -f "$r" ]; then shasum "$r" | cut -c1-12; else git -C "$CLONE" rev-parse --short=12 "$r"; fi
+  done | paste -sd+ -)"
   local want="$version $heads"
 
   if [ "$(cat "$MARKER" 2>/dev/null)" = "$want" ] && ! is_official; then
