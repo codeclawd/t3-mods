@@ -16,6 +16,7 @@
 #        t3-mods status
 #        t3-mods restore            put back the official app; patching pauses
 #        t3-mods uninstall          restore, then remove the agent
+#        t3-mods sign-setup         check the signing key after its one-time approval
 #        t3-mods tick               one agent pass (launchd runs this)
 set -euo pipefail
 
@@ -26,6 +27,9 @@ CLONE="$T3MODS_HOME/t3code"
 SRC="$T3MODS_HOME/src"
 REQUEST="$T3MODS_HOME/request"
 LOG="$T3MODS_HOME/agent.log"
+IDENTITY="$T3MODS_HOME/identity"
+IDENTITY_READY="$T3MODS_HOME/identity.ready"
+IDENTITY_NAME="t3-mods code signing"
 LABEL="com.t3-mods.agent"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 UPSTREAM="https://github.com/pingdotgg/t3code.git"
@@ -193,12 +197,65 @@ patch_app() {
     return 1
   fi
   /bin/mv -f "$staged" "$ASAR" || { log "could not replace app.asar; T3 left as it is"; return 1; }
-  # A Developer ID app with a changed sealed file will not start, so sign ad hoc,
-  # keeping the official designated requirement (the updater checks new
-  # releases against it) and only the entitlements an ad hoc signature can hold.
-  codesign --force --deep -s - --options runtime \
-    --entitlements "$REPO_DIR/lib/entitlements.plist" --preserve-metadata=requirements "$T3_APP" 2>/dev/null ||
-    { log "re-signing failed; run t3-mods restore"; return 1; }
+  # A Developer ID app with a changed sealed file will not start, so re-sign it,
+  # keeping only the entitlements a non-Apple signature can hold. The
+  # requirement accepts official releases (T3's updater checks new versions
+  # against it) or, with the t3-mods identity, this app itself.
+  if [ -f "$IDENTITY_READY" ]; then
+    local hash official
+    hash="$(cat "$IDENTITY")"
+    official="$(codesign -d -r- "$BACKUP" 2>&1 | sed -n 's/^designated => //p')"
+    [ -n "$official" ] || { log "could not read the official requirement; run t3-mods restore"; return 1; }
+    codesign --force --deep -s "$hash" --options runtime --entitlements "$REPO_DIR/lib/entitlements.plist" \
+      -r="designated => ($official) or certificate leaf = H\"$hash\"" "$T3_APP" 2>/dev/null ||
+      { log "re-signing failed; run t3-mods restore"; return 1; }
+  else
+    codesign --force --deep -s - --options runtime \
+      --entitlements "$REPO_DIR/lib/entitlements.plist" --preserve-metadata=requirements "$T3_APP" 2>/dev/null ||
+      { log "re-signing failed; run t3-mods restore"; return 1; }
+  fi
+}
+
+# A self-signed code-signing identity. With it, the patched app satisfies its
+# own designated requirement, so macOS keeps "Allow" answers (Documents access,
+# the keychain) across patches; an ad-hoc signature can't, so they never stick.
+create_identity() {
+  [ -f "$IDENTITY" ] && return 0
+  local dir pass hash
+  dir="$(mktemp -d)" && chmod 700 "$dir" || return 1
+  printf '[req]\ndistinguished_name=dn\nx509_extensions=ext\nprompt=no\n[dn]\nCN=%s\n[ext]\nbasicConstraints=critical,CA:false\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,codeSigning\n' \
+    "$IDENTITY_NAME" > "$dir/cert.cnf"
+  pass="$(/usr/bin/openssl rand -hex 12)"
+  if /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$dir/cert.cnf" \
+      -keyout "$dir/key.pem" -out "$dir/cert.pem" 2>/dev/null &&
+    /usr/bin/openssl pkcs12 -export -inkey "$dir/key.pem" -in "$dir/cert.pem" -name "$IDENTITY_NAME" \
+      -passout "pass:$pass" -out "$dir/id.p12" &&
+    security import "$dir/id.p12" -k "$HOME/Library/Keychains/login.keychain-db" -P "$pass" -T /usr/bin/codesign >/dev/null; then
+    hash="$(/usr/bin/openssl x509 -in "$dir/cert.pem" -noout -fingerprint -sha1 | sed 's/.*=//; s/://g')"
+    echo "$hash" > "$IDENTITY"
+  fi
+  rm -rf "$dir"
+  [ -f "$IDENTITY" ]
+}
+
+# One test signature with a time limit. If macOS still needs the key's one-time
+# approval it asks once and the test fails; the agent keeps signing ad hoc.
+check_identity() {
+  rm -f "$IDENTITY_READY"
+  [ -f "$IDENTITY" ] || return 1
+  local probe; probe="$(mktemp)"
+  cp /usr/bin/true "$probe"
+  if perl -e 'alarm 20; exec @ARGV' codesign --force -s "$(cat "$IDENTITY")" "$probe" >/dev/null 2>&1; then
+    touch "$IDENTITY_READY"
+  fi
+  rm -f "$probe"
+  [ -f "$IDENTITY_READY" ]
+}
+
+sign_setup_hint() {
+  echo "To let t3-mods sign without asking, run this once in Terminal (it asks for your Mac login password):"
+  echo "  security set-key-partition-list -S apple-tool:,apple: -s -l \"$IDENTITY_NAME\" ~/Library/Keychains/login.keychain-db"
+  echo "Then run: $REPO_DIR/bin/t3-mods sign-setup"
 }
 
 restore_app() {
@@ -250,7 +307,11 @@ tick() {
   done | paste -sd+ -)"
   local want="$version $heads"
 
-  if [ "$(cat "$MARKER" 2>/dev/null)" = "$want" ] && ! is_official; then
+  # Which signature the patched app carries lives here, not in the app (writing
+  # into the app after signing would break the signature).
+  local mode=adhoc; [ -f "$IDENTITY_READY" ] && mode=identity
+  if [ "$(cat "$MARKER" 2>/dev/null)" = "$want" ] && ! is_official &&
+    [ "$(cat "$T3MODS_HOME/signed" 2>/dev/null)" = "$want $mode" ]; then
     [ "$request" = apply ] && log "already patched: $want"
     return 0
   fi
@@ -298,7 +359,8 @@ tick() {
     [ "$reopen" = 1 ] && open "$T3_APP"
     return 1
   fi
-  log "patched $want"
+  printf '%s\n' "$want $mode" > "$T3MODS_HOME/signed"
+  log "patched $want ($mode signature)"
   if [ "$reopen" = 1 ] || [ "$request" = apply ]; then open "$T3_APP"; fi
   notify "T3 mods applied to $version."
 }
@@ -330,6 +392,11 @@ install() {
     echo "Cloning T3 Code (blobless, a few hundred MB)…"
     git clone -q --filter=blob:none --no-checkout "$UPSTREAM" "$CLONE"
   fi
+  if create_identity && check_identity; then
+    echo "Signing key ready ($IDENTITY_NAME)."
+  else
+    sign_setup_hint
+  fi
   if [ "$agent" = 1 ]; then
     mkdir -p "$(dirname "$PLIST")"
     sed -e "s|@REPO_DIR@|$REPO_DIR|g" -e "s|@T3MODS_HOME@|$T3MODS_HOME|g" -e "s|@T3_APP@|$T3_APP|g" \
@@ -353,6 +420,7 @@ status() {
   echo "built:    $(cat "$SRC/apps/server/dist/.t3-mods" 2>/dev/null || echo none)"
   echo "patches:  $T3_PATCHES"
   echo "backup:   $(cat "$BACKUP.version" 2>/dev/null || echo none)"
+  if [ -f "$IDENTITY_READY" ]; then echo "signing:  $IDENTITY_NAME"; else echo "signing:  ad hoc (run t3-mods sign-setup)"; fi
   if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then echo "agent:    loaded"; else echo "agent:    not loaded"; fi
   echo "log:      $LOG"
   tail -5 "$LOG" 2>/dev/null | sed 's/^/          /'
@@ -379,5 +447,12 @@ case "${1:-}" in
   restore) request restore "${2:-5}" ;;
   uninstall) request uninstall "${2:-5}" ;;
   status) status ;;
+  sign-setup)
+    load_config
+    if create_identity && check_identity; then
+      echo "Signing key ready. The next patch uses it; run t3-mods apply to re-sign now."
+    else
+      sign_setup_hint; exit 1
+    fi ;;
   *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

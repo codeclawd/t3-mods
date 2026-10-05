@@ -25,8 +25,11 @@ git clone https://github.com/codeclawd/t3-mods.git ~/t3-mods
 ~/t3-mods/bin/t3-mods apply            # quits T3, patches, reopens it; don't reopen it yourself
 ```
 
-The first install clones T3 Code and builds it, which takes a few minutes. When T3 reopens, macOS
-asks for your password to read T3's keychain item. Click **Always Allow**.
+The first install clones T3 Code and builds it, which takes a few minutes. It also creates a
+self-signed code-signing key ("t3-mods code signing") in your login keychain. If it prints a
+`security set-key-partition-list` command, run that once in Terminal (it asks for your Mac
+password), then run `t3-mods sign-setup`. When T3 reopens, macOS asks once to let T3 read its
+keychain item and your folders. Click **Allow**; with the key in place, those answers stick.
 
 ## Commands
 
@@ -37,6 +40,7 @@ asks for your password to read T3's keychain item. Click **Always Allow**.
 | `t3-mods status` | Shows the T3 version, patch state, agent state and recent log lines |
 | `t3-mods restore` | Puts back the official app and pauses patching (`apply` resumes) |
 | `t3-mods uninstall` | Restores the official app and removes the agent |
+| `t3-mods sign-setup` | Checks the signing key after its one-time approval |
 
 ## Which plugins work
 
@@ -77,8 +81,10 @@ releases. After an update the agent builds again and tells you to quit T3 once.
 
 ## Costs and limits
 
-- **Keychain prompt:** each patched build has a new ad-hoc signature, so macOS asks once per T3
-  update. Click Always Allow.
+- **Signing:** t3-mods re-signs T3 with its own key and a requirement that also accepts official
+  releases, so T3's updater keeps working and macOS remembers your Allow answers. Without the
+  key's one-time approval it falls back to an ad-hoc signature, and macOS asks again on every
+  launch.
 - **Dropped entitlements:** an ad-hoc signature can't hold T3's Apple-restricted entitlements.
   Passkey sign-in for T3 Connect may fail in a patched app.
 - **One build at a time:** state lives in `~/.t3-mods` (clone, build worktree, one official app

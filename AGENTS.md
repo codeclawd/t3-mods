@@ -30,6 +30,11 @@ bin/t3-mods install --app "/Applications/T3 Code (Alpha).app"   # another app
 The first run clones T3 Code (a few hundred MB) and builds it, which takes a few minutes. Wait for it
 to finish. Success ends with `Agent installed (com.t3-mods.agent)`.
 
+If the output includes a `security set-key-partition-list` command, give it to the user to run
+in their own Terminal (it asks for their Mac login password; never ask for the password
+yourself). After they run it, run `bin/t3-mods sign-setup` and expect `Signing key ready`.
+Don't run `codesign` yourself before that: macOS would ask once per signed file.
+
 If it fails, read `~/.t3-mods/agent.log`, `~/.t3-mods/last-install.log` and
 `~/.t3-mods/last-build.log`, then report the error to the user.
 
