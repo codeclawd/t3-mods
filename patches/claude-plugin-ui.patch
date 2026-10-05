@@ -1,7 +1,7 @@
 From 091db8857d76b3c3b4972f62756001bb946b0f61 Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 20:15:22 -0500
-Subject: [PATCH 1/3] feat(claude): draw Claude Code plugin status lines,
+Subject: [PATCH 1/4] feat(claude): draw Claude Code plugin status lines,
  toasts and prompt band
 
 Claude Code plugins draw UI with $.ui.status, $.ui.toast and an
@@ -1166,7 +1166,7 @@ index 9fb0f186..62511457 100644
 From 27fedfde3193f3991d004d0cc6dbb2d2ca854464 Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 21:25:06 -0500
-Subject: [PATCH 2/3] fix(claude): draw plugin block art without seams and fit
+Subject: [PATCH 2/4] fix(claude): draw plugin block art without seams and fit
  the band's width
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1394,7 +1394,7 @@ index f6b7edec..d5014346 100644
 From fd57bef80253e85b668f3bbc764ea4b6bf8365f4 Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 07:40:10 -0500
-Subject: [PATCH 3/3] fix(claude): bound plugin UI memory and ignore replaced
+Subject: [PATCH 3/4] fix(claude): bound plugin UI memory and ignore replaced
  queries
 
 - Each subscriber now gets a one-slot change signal and reads the current
@@ -1679,6 +1679,167 @@ index d8dc29f5..7e4cfff2 100644
          );
        }),
      );
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 7616fc3d6e9264ea20dc2c0ebca82c94ff51dff8 Mon Sep 17 00:00:00 2001
+From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 07:52:24 -0500
+Subject: [PATCH 4/4] docs(claude): document plugin UI service and band
+ renderer functions
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ apps/server/src/provider/ClaudePluginUi.ts          | 11 +++++++++++
+ apps/web/src/components/chat/ClaudePluginUiBand.tsx |  7 +++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/apps/server/src/provider/ClaudePluginUi.ts b/apps/server/src/provider/ClaudePluginUi.ts
+index 7e4cfff2..a11af5a1 100644
+--- a/apps/server/src/provider/ClaudePluginUi.ts
++++ b/apps/server/src/provider/ClaudePluginUi.ts
+@@ -57,6 +57,7 @@ export class ClaudePluginUi extends Context.Service<ClaudePluginUi, ClaudePlugin
+   "t3/provider/ClaudePluginUi",
+ ) {}
+ 
++/** A plain object, not null or an array. */
+ const isRecord = (value: unknown): value is Record<string, unknown> =>
+   typeof value === "object" && value !== null && !Array.isArray(value);
+ 
+@@ -73,6 +74,7 @@ export const bandFromRenderResponse = (envelope: unknown): ClaudePluginUiElement
+   return tree as unknown as ClaudePluginUiElement;
+ };
+ 
++/** Builds the service: per-thread plugin UI state, band renders, and subscriber signals. */
+ export const make = Effect.sync(() => {
+   const threads = new Map<ThreadId, ThreadEntry>();
+   let toastCount = 0;
+@@ -81,6 +83,7 @@ export const make = Effect.sync(() => {
+   // backlog of snapshots.
+   const watchers = new Map<ThreadId, Set<Queue.Queue<void>>>();
+ 
++  /** The thread's entry, created empty on first use. */
+   const entryFor = (threadId: ThreadId): ThreadEntry => {
+     let entry = threads.get(threadId);
+     if (entry === undefined) {
+@@ -95,6 +98,7 @@ export const make = Effect.sync(() => {
+     return entry;
+   };
+ 
++  /** Applies `next` to the thread's snapshot and signals its subscribers when it changed. */
+   const update = (
+     threadId: ThreadId,
+     next: (snapshot: ClaudePluginUiSnapshot) => ClaudePluginUiSnapshot,
+@@ -126,6 +130,7 @@ export const make = Effect.sync(() => {
+       }
+     });
+ 
++  /** Asks the CLI to draw the AbovePrompt band and stores the tree if this query is still current. */
+   const renderBand = (threadId: ThreadId, request: ClaudeControlRequest) =>
+     Effect.tryPromise(() =>
+       request({
+@@ -185,12 +190,14 @@ export const make = Effect.sync(() => {
+       );
+     });
+ 
++  /** Registers a thread's live query and asks it for the band. */
+   const attach: ClaudePluginUiShape["attach"] = (threadId, request) =>
+     Effect.suspend(() => {
+       entryFor(threadId).request = request;
+       return requestRender(threadId);
+     });
+ 
++  /** Clears a thread's plugin UI when the query that attached it closes. */
+   const detach: ClaudePluginUiShape["detach"] = (threadId, request) =>
+     Effect.suspend(() => {
+       const entry = threads.get(threadId);
+@@ -202,6 +209,7 @@ export const make = Effect.sync(() => {
+       );
+     });
+ 
++  /** Applies one `ui_status`, `ui_toast` or `ui_invalidate` message from the current query. */
+   const ingest: ClaudePluginUiShape["ingest"] = (threadId, message, from) => {
+     if (!isRecord(message) || message.type !== "system") return Effect.void;
+     // A late message from a replaced query must not draw over the current one.
+@@ -239,6 +247,7 @@ export const make = Effect.sync(() => {
+     }
+   };
+ 
++  /** The thread's current snapshot, then the latest one after each change. */
+   const subscribe: ClaudePluginUiShape["subscribe"] = (threadId) =>
+     Stream.unwrap(
+       Effect.gen(function* () {
+@@ -264,6 +273,7 @@ export const make = Effect.sync(() => {
+       }),
+     );
+ 
++  /** Forwards a plugin Button press to the thread's live query. */
+   const press: ClaudePluginUiShape["press"] = (input) =>
+     Effect.suspend(() => {
+       const request = threads.get(input.threadId)?.request;
+@@ -287,4 +297,5 @@ export const make = Effect.sync(() => {
+   return ClaudePluginUi.of({ attach, detach, ingest, subscribe, press });
+ });
+ 
++/** Provides the shared ClaudePluginUi service. */
+ export const layer = Layer.effect(ClaudePluginUi, make);
+diff --git a/apps/web/src/components/chat/ClaudePluginUiBand.tsx b/apps/web/src/components/chat/ClaudePluginUiBand.tsx
+index c573e2b1..a2d8ad37 100644
+--- a/apps/web/src/components/chat/ClaudePluginUiBand.tsx
++++ b/apps/web/src/components/chat/ClaudePluginUiBand.tsx
+@@ -91,9 +91,11 @@ export function ClaudePluginUiBand(props: {
+ 
+ type Press = (target: { plugin: string; handle: number }, key: string | undefined) => void;
+ 
++/** A horizontal size in terminal cells (`ch`); strings pass through as CSS. */
+ const cells = (value: unknown): string | undefined =>
+   typeof value === "number" ? `${value}ch` : typeof value === "string" ? value : undefined;
+ 
++/** A vertical size in terminal rows; strings pass through as CSS. */
+ const lines = (value: unknown): string | undefined =>
+   typeof value === "number" ? `${value * 1.25}em` : typeof value === "string" ? value : undefined;
+ 
+@@ -101,6 +103,7 @@ const lines = (value: unknown): string | undefined =>
+ const color = (value: unknown): string | undefined =>
+   typeof value === "string" && !value.startsWith("ansi") ? value : undefined;
+ 
++/** Maps an Ink-style Box's layout props to flexbox CSS. */
+ function boxStyle(props: Readonly<Record<string, unknown>>): CSSProperties {
+   const style: CSSProperties = {
+     display: props.display === "none" ? "none" : "flex",
+@@ -143,6 +146,7 @@ function boxStyle(props: Readonly<Record<string, unknown>>): CSSProperties {
+   return style;
+ }
+ 
++/** Maps an Ink-style Text's color and style props to CSS. */
+ function textStyle(props: Readonly<Record<string, unknown>>): CSSProperties {
+   const inverse = props.inverse === true;
+   const fg = color(props.color);
+@@ -263,6 +267,7 @@ function blockStyle(mask: number, count: number): CSSProperties {
+ /** Full and half blocks look the same at any width, so their runs draw as one box. */
+ const MERGEABLE_MASKS = new Set([15, 12, 3]);
+ 
++/** Draws a string, painting block elements as boxes and everything else as text. */
+ function renderText(text: string, key: string): ReactNode {
+   const chars = [...text];
+   if (!chars.some((char) => char in BLOCK_QUADRANTS)) {
+@@ -299,6 +304,7 @@ function renderText(text: string, key: string): ReactNode {
+   );
+ }
+ 
++/** Draws a node's children in order. */
+ function renderChildren(
+   children: ReadonlyArray<ClaudePluginUiChild> | undefined,
+   path: string,
+@@ -312,6 +318,7 @@ function renderChildren(
+   );
+ }
+ 
++/** Draws one plugin tree node from the desktop element table; unknown types draw nothing. */
+ function renderNode(node: ClaudePluginUiElement, path: string, press: Press): ReactNode {
+   const props = node.props ?? {};
+   const key = typeof props.key === "string" ? props.key : path;
 -- 
 2.50.1 (Apple Git-155)
 
