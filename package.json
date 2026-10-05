@@ -1,0 +1,11 @@
+{
+  "name": "t3-mods",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Claude Code plugin UI in the T3 Code desktop app, kept across T3 updates (macOS)",
+  "license": "MIT",
+  "dependencies": {
+    "@electron/asar": "4.3.1"
+  }
+}

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.t3-mods.agent</string>
+  <key>ProgramArguments</key>
+  <array><string>/bin/bash</string><string>@REPO_DIR@/bin/t3-mods</string><string>tick</string></array>
+  <key>EnvironmentVariables</key>
+  <dict><key>T3MODS_HOME</key><string>@T3MODS_HOME@</string></dict>
+  <!-- T3's updater replaces the app, which rewrites this file. -->
+  <key>WatchPaths</key><array><string>@T3_APP@/Contents/Info.plist</string></array>
+  <key>RunAtLoad</key><true/>
+  <!-- A quiet no-op unless there is something to do. -->
+  <key>StartInterval</key><integer>15</integer>
+  <key>StandardOutPath</key><string>@T3MODS_HOME@/agent.log</string>
+  <key>StandardErrorPath</key><string>@T3MODS_HOME@/agent.log</string>
+</dict>
+</plist>

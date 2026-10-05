@@ -1,0 +1,337 @@
+#!/bin/bash
+# t3-mods: draw Claude Code plugin UI (status lines, toasts, the band above the
+# prompt) in the T3 Code desktop app on macOS, and keep it there across T3's
+# own updates.
+#
+# How: T3 runs Claude headless and drops the UI that plugins send. A patch
+# branch of T3 draws it. For the T3 release you have installed, t3-mods builds
+# that release's exact tag plus your patch branches, points the app's
+# apps/server/dist at the build (an asar header edit, see lib/asar-patch.mjs),
+# and re-signs the app ad hoc while keeping T3's official signing requirement,
+# so T3's own updater still accepts official releases. After each update the
+# launchd agent rebuilds and re-applies.
+#
+# usage: t3-mods install [--app PATH] [--no-agent]
+#        t3-mods apply [SECONDS]    quit T3, patch, reopen (after SECONDS, default 5)
+#        t3-mods status
+#        t3-mods restore            put back the official app; patching pauses
+#        t3-mods uninstall          restore, then remove the agent
+#        t3-mods tick               one agent pass (launchd runs this)
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+T3MODS_HOME="${T3MODS_HOME:-$HOME/.t3-mods}"
+CONFIG="$T3MODS_HOME/config.env"
+CLONE="$T3MODS_HOME/t3code"
+SRC="$T3MODS_HOME/src"
+REQUEST="$T3MODS_HOME/request"
+LOG="$T3MODS_HOME/agent.log"
+LABEL="com.t3-mods.agent"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+UPSTREAM="https://github.com/pingdotgg/t3code.git"
+FETCH_EVERY_SECONDS=600
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+
+log() { echo "[$(date '+%F %T')] $*"; }
+die() { echo "t3-mods: $*" >&2; exit 1; }
+notify() { osascript -e "display notification \"$1\" with title \"t3-mods\"" >/dev/null 2>&1 || true; }
+plist_value() { /usr/libexec/PlistBuddy -c "Print $1" "$T3_APP/Contents/Info.plist"; }
+
+load_config() {
+  [ -f "$CONFIG" ] || die "not installed; run: $REPO_DIR/bin/t3-mods install"
+  # shellcheck source=/dev/null
+  . "$CONFIG"
+  : "${T3_APP:?set T3_APP in $CONFIG}"
+  : "${T3_PATCHES:?set T3_PATCHES in $CONFIG}"
+  ASAR="$T3_APP/Contents/Resources/app.asar"
+  MARKER="$ASAR.unpacked/apps/server/dist/.t3-mods"
+  BACKUP="$T3MODS_HOME/backup/$(basename "$T3_APP")"
+  # pgrep never matches itself and needs no pipe; the path has regex characters.
+  APP_RE="$(printf '%s' "$T3_APP/Contents/MacOS/" | sed 's/[][\.*^$()+?{}|]/\\&/g')"
+}
+
+app_running() { pgrep -f "$APP_RE" >/dev/null; }
+# The main process is the bare executable; helpers and the backend carry more.
+main_pids() {
+  local exe; exe="$T3_APP/Contents/MacOS/$(plist_value CFBundleExecutable)"
+  ps -axo pid=,command= | while read -r pid cmd; do [ "$cmd" = "$exe" ] && echo "$pid"; done || true
+}
+# A string match, not `| grep -q`: under pipefail grep's early exit fails the pipe.
+is_official() {
+  local info re='TeamIdentifier=[A-Z0-9]{10}'
+  info="$(codesign -dv "$T3_APP" 2>&1 || true)"
+  [[ "$info" =~ $re ]]
+}
+
+quit_app() {
+  app_running || return 0
+  notify "Updating T3 Code. It reopens by itself in about 30 seconds; don't reopen it."
+  # SIGTERM is Electron's normal quit (AppleScript quit is ignored from launchd).
+  for pid in $(main_pids); do kill -TERM "$pid" 2>/dev/null || true; done
+  for _ in $(seq 1 20); do app_running || return 0; sleep 1; done
+  log "stopping T3 Code processes still running after 20 s"
+  pkill -KILL -f "$APP_RE" || true
+  for _ in $(seq 1 10); do app_running || return 0; sleep 1; done
+  return 1
+}
+
+# The request file holds "<action> <epoch second>"; it is due once that time passes.
+due_request() {
+  [ -f "$REQUEST" ] || return 1
+  local action at; read -r action at < "$REQUEST" || true
+  [ "$(date +%s)" -ge "${at:-0}" ] || return 1
+  rm -f "$REQUEST"
+  echo "$action"
+}
+
+# Patch heads, refreshed from their remotes at most every FETCH_EVERY_SECONDS.
+patch_refs() {
+  local i=0 stamp="$T3MODS_HOME/.fetched" now; now="$(date +%s)"
+  local fresh=0
+  [ -f "$stamp" ] && [ $((now - $(cat "$stamp"))) -lt "$FETCH_EVERY_SECONDS" ] && fresh=1
+  for entry in $T3_PATCHES; do
+    i=$((i + 1))
+    if [ "$fresh" = 0 ] || ! git -C "$CLONE" rev-parse -q --verify "refs/t3mods/patch$i" >/dev/null; then
+      git -C "$CLONE" fetch -q "${entry%%#*}" "+refs/heads/${entry#*#}:refs/t3mods/patch$i"
+    fi
+    echo "refs/t3mods/patch$i"
+  done
+  [ "$fresh" = 1 ] || echo "$now" > "$stamp"
+}
+
+# Runs in a subshell where `set -e` is off, so every step checks itself.
+build() {
+  local version=$1 want=$2 refs=$3
+  git -C "$CLONE" fetch -q origin "refs/tags/v$version:refs/tags/v$version" main || return 1
+  [ -d "$SRC" ] || git -C "$CLONE" worktree add -q --detach "$SRC" "v$version" || return 1
+  cd "$SRC" || return 1
+  git reset -q --hard && git checkout -q --detach -f "v$version" || return 1
+  local applied=0 earlier="" ref commit wanted
+  for ref in $refs; do
+    # This branch's own commits (not upstream's, not an earlier patch's), oldest
+    # first, keeping only those `git cherry` finds missing from the release.
+    wanted=" $(git cherry "v$version" "$ref" | awk '$1 == "+" { printf "%s ", $2 }')"
+    # shellcheck disable=SC2086 # $earlier is a list of ^refs
+    for commit in $(git rev-list --reverse --no-merges "$ref" ^origin/main $earlier); do
+      case "$wanted" in *" $commit "*) ;; *) continue ;; esac
+      if ! git -c user.name=t3-mods -c user.email=t3-mods@localhost cherry-pick "$commit" >/dev/null 2>&1; then
+        git cherry-pick --abort || true
+        log "$ref ($commit) does not apply to v$version; left T3 as it is"
+        return 2
+      fi
+      applied=$((applied + 1))
+    done
+    earlier="$earlier ^$ref"
+  done
+  if [ "$applied" = 0 ]; then
+    log "v$version already contains every patch; nothing to build"
+    return 3
+  fi
+  local vp_version
+  vp_version="$(awk '/^ *vite-plus:/ { print $2; exit }' pnpm-workspace.yaml | tr -d "\"'")"
+  npx -y -p "vite-plus@$vp_version" vp i > "$T3MODS_HOME/last-install.log" 2>&1 ||
+    { log "dependency install failed; see $T3MODS_HOME/last-install.log"; return 1; }
+  node scripts/update-release-package-versions.ts "$version" > /dev/null || return 1
+  node_modules/.bin/vp run --filter t3 build > "$T3MODS_HOME/last-build.log" 2>&1 ||
+    { log "build failed; see $T3MODS_HOME/last-build.log"; return 1; }
+  local brand=production; case "$version" in *-nightly.*) brand=nightly ;; esac
+  node scripts/apply-web-brand-assets.ts "$brand" apps/server/dist/client > /dev/null || return 1
+  git checkout -q -- . # the version stamp only exists to build
+  printf '%s\n' "$want" > apps/server/dist/.t3-mods
+}
+
+patch_app() {
+  local version=$1
+  # Keep one known-good official copy, taken before the first patch of a release.
+  if is_official && [ "$(cat "$BACKUP.version" 2>/dev/null)" != "$version" ]; then
+    mkdir -p "$(dirname "$BACKUP")"
+    rm -rf "$BACKUP" && /usr/bin/ditto "$T3_APP" "$BACKUP" && printf '%s\n' "$version" > "$BACKUP.version"
+  fi
+  local staged="$T3MODS_HOME/staging/app.asar"
+  node "$REPO_DIR/lib/asar-patch.mjs" "$ASAR" "$SRC/apps/server/dist" "$staged"
+  # Apple binaries write inside the bundle (macOS App Management lets them);
+  # files first, header last, so the header never points at missing files.
+  if ! /bin/mkdir -p "$ASAR.unpacked/apps/server/dist" ||
+    ! /usr/bin/ditto "$SRC/apps/server/dist" "$ASAR.unpacked/apps/server/dist"; then
+    log "macOS refused to write into $T3_APP (App Management); T3 left as it is"
+    notify "macOS blocked t3-mods from updating T3 Code. Allow it in System Settings > Privacy & Security > App Management (add /bin/bash), then run t3-mods apply."
+    return 1
+  fi
+  /bin/mv -f "$staged" "$ASAR"
+  # A Developer ID app with a changed sealed file will not start, so sign ad hoc,
+  # keeping the official designated requirement (the updater checks new
+  # releases against it) and only the entitlements an ad hoc signature can hold.
+  codesign --force --deep -s - --options runtime \
+    --entitlements "$REPO_DIR/lib/entitlements.plist" --preserve-metadata=requirements "$T3_APP" 2>/dev/null
+}
+
+restore_app() {
+  [ -d "$BACKUP" ] || { log "no official copy saved; reinstall T3 Code"; return 1; }
+  [ "$(cat "$BACKUP.version" 2>/dev/null)" = "$(plist_value CFBundleShortVersionString)" ] ||
+    log "saved copy is $(cat "$BACKUP.version"), installed is newer; restoring the saved copy anyway"
+  quit_app || { log "T3 Code did not quit; not restoring"; return 1; }
+  /bin/rm -rf "$T3_APP" && /usr/bin/ditto "$BACKUP" "$T3_APP"
+  touch "$T3MODS_HOME/paused"
+  open "$T3_APP"
+  log "restored the official app; patching paused (t3-mods apply resumes it)"
+}
+
+tick() {
+  mkdir -p "$T3MODS_HOME"
+  if ! mkdir "$T3MODS_HOME/.lock" 2>/dev/null; then
+    # A crashed run can leave the lock; anything older than 15 minutes is stale.
+    [ -n "$(find "$T3MODS_HOME/.lock" -maxdepth 0 -mmin +15 2>/dev/null)" ] || return 0
+    rmdir "$T3MODS_HOME/.lock"; mkdir "$T3MODS_HOME/.lock"
+  fi
+  trap 'rmdir "$T3MODS_HOME/.lock" 2>/dev/null || true' RETURN EXIT
+  load_config
+  [ -d "$T3_APP" ] || return 0
+
+  local request=""; request="$(due_request || true)"
+  case "$request" in
+    restore) restore_app; return ;;
+    uninstall)
+      restore_app || true
+      rm -f "$PLIST"
+      log "uninstalled the agent; delete $T3MODS_HOME and $REPO_DIR when you like"
+      launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true # ends this process
+      return ;;
+    apply) rm -f "$T3MODS_HOME/paused" ;;
+  esac
+  [ -f "$T3MODS_HOME/paused" ] && return 0
+
+  local version; version="$(plist_value CFBundleShortVersionString)"
+  local refs; refs="$(patch_refs | tr '\n' ' ')"
+  local heads r; heads="$(for r in $refs; do git -C "$CLONE" rev-parse --short=12 "$r"; done | paste -sd+ -)"
+  local want="$version $heads"
+
+  if [ "$(cat "$MARKER" 2>/dev/null)" = "$want" ] && ! is_official; then
+    [ "$request" = apply ] && log "already patched: $want"
+    return 0
+  fi
+  local built; built="$(cat "$SRC/apps/server/dist/.t3-mods" 2>/dev/null || true)"
+  if [ "$built" = "$want" ] && [ "$request" != apply ] && app_running; then
+    return 0 # built; waiting for T3 to close
+  fi
+
+  if [ "$built" != "$want" ]; then
+    log "building $want"
+    local status=0; ( build "$version" "$want" "$refs" ) || status=$?
+    case "$status" in
+      0) ;;
+      3) return 0 ;;
+      *)
+        if [ "$(cat "$T3MODS_HOME/.notified" 2>/dev/null)" != "fail $want" ]; then
+          notify "Your T3 patches don't apply to $version yet. T3 runs unpatched; see $LOG."
+          printf 'fail %s\n' "$want" > "$T3MODS_HOME/.notified"
+        fi
+        return 1 ;;
+    esac
+  fi
+
+  # Only the launchd agent writes into the app: macOS may refuse writes into an
+  # app bundle from a terminal or an agent running inside T3 (App Management).
+  if [ "${T3MODS_BUILD_ONLY:-0}" = 1 ]; then
+    log "built $want; the agent applies it"
+    return 0
+  fi
+  local reopen=0
+  if app_running; then
+    if [ "$request" = apply ]; then
+      quit_app || { log "T3 Code did not quit; not patching"; return 1; }
+      reopen=1
+    else
+      if [ "$(cat "$T3MODS_HOME/.notified" 2>/dev/null)" != "ready $want" ]; then
+        notify "T3 mods are ready for $version. Quit T3 Code and they apply within 15 seconds."
+        printf 'ready %s\n' "$want" > "$T3MODS_HOME/.notified"
+      fi
+      log "built $want; waiting for T3 Code to close"
+      return 0
+    fi
+  fi
+  if ! patch_app "$version"; then
+    [ "$reopen" = 1 ] && open "$T3_APP"
+    return 1
+  fi
+  log "patched $want"
+  if [ "$reopen" = 1 ] || [ "$request" = apply ]; then open "$T3_APP"; fi
+  notify "T3 mods applied to $version."
+}
+
+install() {
+  local app="" agent=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --app) app="$2"; shift 2 ;;
+      --no-agent) agent=0; shift ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [ "$(uname -s)" = Darwin ] || die "macOS only"
+  command -v git >/dev/null || die "git is missing (xcode-select --install)"
+  command -v node >/dev/null || die "Node.js 24+ is missing"
+  [ "$(node -p 'process.versions.node.split(".")[0]')" -ge 24 ] || die "Node.js 24+ is required (found $(node -v))"
+  mkdir -p "$T3MODS_HOME"
+  if [ ! -f "$CONFIG" ]; then
+    cp "$REPO_DIR/config.example.env" "$CONFIG"
+  fi
+  if [ -n "$app" ]; then
+    sed -i '' "s|^T3_APP=.*|T3_APP=\"$app\"|" "$CONFIG"
+  fi
+  load_config
+  [ -d "$T3_APP" ] || die "no T3 Code app at $T3_APP; set T3_APP in $CONFIG"
+  (cd "$REPO_DIR" && npm install --silent --no-audit --no-fund) || die "npm install failed in $REPO_DIR"
+  if [ ! -d "$CLONE/.git" ]; then
+    echo "Cloning T3 Code (blobless, a few hundred MB)…"
+    git clone -q --filter=blob:none --no-checkout "$UPSTREAM" "$CLONE"
+  fi
+  if [ "$agent" = 1 ]; then
+    mkdir -p "$(dirname "$PLIST")"
+    sed -e "s|@REPO_DIR@|$REPO_DIR|g" -e "s|@T3MODS_HOME@|$T3MODS_HOME|g" -e "s|@T3_APP@|$T3_APP|g" \
+      "$REPO_DIR/launchd/agent.plist" > "$PLIST"
+    launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  fi
+  echo "Building the patch for $(plist_value CFBundleShortVersionString) (first build takes a few minutes)…"
+  if [ "$agent" = 1 ]; then T3MODS_BUILD_ONLY=1 tick 2>&1 | tee -a "$LOG"; else tick 2>&1 | tee -a "$LOG"; fi
+  if [ "$agent" = 1 ]; then
+    launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    echo "Agent installed ($LABEL). Run 't3-mods apply' or quit T3 Code to load the patch."
+  fi
+}
+
+status() {
+  load_config
+  local version; version="$(plist_value CFBundleShortVersionString)"
+  echo "app:      $T3_APP ($version)"
+  if is_official; then echo "state:    official (not patched)"; else echo "state:    patched ($(cat "$MARKER" 2>/dev/null))"; fi
+  [ -f "$T3MODS_HOME/paused" ] && echo "paused:   yes (t3-mods apply resumes)"
+  echo "built:    $(cat "$SRC/apps/server/dist/.t3-mods" 2>/dev/null || echo none)"
+  echo "patches:  $T3_PATCHES"
+  echo "backup:   $(cat "$BACKUP.version" 2>/dev/null || echo none)"
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then echo "agent:    loaded"; else echo "agent:    not loaded"; fi
+  echo "log:      $LOG"
+  tail -5 "$LOG" 2>/dev/null | sed 's/^/          /'
+}
+
+request() {
+  local action=$1 delay=${2:-5}
+  load_config
+  mkdir -p "$T3MODS_HOME"
+  echo "$action $(( $(date +%s) + delay ))" > "$REQUEST"
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    echo "Requested '$action' in ${delay}s. T3 Code closes and reopens by itself; don't reopen it."
+  else
+    echo "No agent loaded; running '$action' now."
+    sleep "$delay"; tick 2>&1 | tee -a "$LOG"
+  fi
+}
+
+case "${1:-}" in
+  install) shift; install "$@" ;;
+  tick) tick >> "$LOG" 2>&1 ;;
+  apply) request apply "${2:-5}" ;;
+  restore) request restore "${2:-5}" ;;
+  uninstall) request uninstall "${2:-5}" ;;
+  status) status ;;
+  *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
