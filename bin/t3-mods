@@ -3,9 +3,9 @@
 # prompt) in the T3 Code desktop app on macOS, and keep it there across T3's
 # own updates.
 #
-# How: T3 runs Claude headless and drops the UI that plugins send. A patch
-# branch of T3 draws it. For the T3 release you have installed, t3-mods builds
-# that release's exact tag plus your patch branches, points the app's
+# How: T3 runs Claude headless and drops the UI that plugins send. A patch to
+# T3 (patches/claude-plugin-ui.patch) draws it. For the T3 release you have
+# installed, t3-mods builds that release's exact tag plus your patches, points the app's
 # apps/server/dist at the build (an asar header edit, see lib/asar-patch.mjs),
 # and re-signs the app ad hoc while keeping T3's official signing requirement,
 # so T3's own updater still accepts official releases. After each update the
