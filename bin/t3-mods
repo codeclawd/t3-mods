@@ -78,8 +78,9 @@ quit_app() {
 # The request file holds "<action> <epoch second>"; it is due once that time passes.
 due_request() {
   [ -f "$REQUEST" ] || return 1
-  local action at; read -r action at < "$REQUEST" || true
-  [ "$(date +%s)" -ge "${at:-0}" ] || return 1
+  local action="" at=""; read -r action at < "$REQUEST" || true
+  [ -n "$action" ] && [ -n "$at" ] || return 1
+  [ "$(date +%s)" -ge "$at" ] || return 1
   rm -f "$REQUEST"
   echo "$action"
 }
@@ -140,15 +141,24 @@ build() {
   printf '%s\n' "$want" > apps/server/dist/.t3-mods
 }
 
+# Called from `if`, where `set -e` is off: every step checks itself.
 patch_app() {
   local version=$1
   # Keep one known-good official copy, taken before the first patch of a release.
+  # Copy beside it, then swap, so a failed copy never costs the old backup.
   if is_official && [ "$(cat "$BACKUP.version" 2>/dev/null)" != "$version" ]; then
-    mkdir -p "$(dirname "$BACKUP")"
-    rm -rf "$BACKUP" && /usr/bin/ditto "$T3_APP" "$BACKUP" && printf '%s\n' "$version" > "$BACKUP.version"
+    mkdir -p "$(dirname "$BACKUP")" || return 1
+    rm -rf "$BACKUP.new"
+    if ! /usr/bin/ditto "$T3_APP" "$BACKUP.new"; then
+      rm -rf "$BACKUP.new"; log "could not save the official app; not patching"; return 1
+    fi
+    rm -rf "$BACKUP" && mv "$BACKUP.new" "$BACKUP" && printf '%s\n' "$version" > "$BACKUP.version" || return 1
   fi
+  [ -d "$BACKUP" ] || { log "no official copy saved; not patching"; return 1; }
   local staged="$T3MODS_HOME/staging/app.asar"
-  node "$REPO_DIR/lib/asar-patch.mjs" "$ASAR" "$SRC/apps/server/dist" "$staged"
+  rm -f "$staged"
+  node "$REPO_DIR/lib/asar-patch.mjs" "$ASAR" "$SRC/apps/server/dist" "$staged" ||
+    { log "could not build the new asar header; T3 left as it is"; return 1; }
   # Apple binaries write inside the bundle (macOS App Management lets them);
   # files first, header last, so the header never points at missing files.
   if ! /bin/mkdir -p "$ASAR.unpacked/apps/server/dist" ||
@@ -157,12 +167,13 @@ patch_app() {
     notify "macOS blocked t3-mods from updating T3 Code. Allow it in System Settings > Privacy & Security > App Management (add /bin/bash), then run t3-mods apply."
     return 1
   fi
-  /bin/mv -f "$staged" "$ASAR"
+  /bin/mv -f "$staged" "$ASAR" || { log "could not replace app.asar; T3 left as it is"; return 1; }
   # A Developer ID app with a changed sealed file will not start, so sign ad hoc,
   # keeping the official designated requirement (the updater checks new
   # releases against it) and only the entitlements an ad hoc signature can hold.
   codesign --force --deep -s - --options runtime \
-    --entitlements "$REPO_DIR/lib/entitlements.plist" --preserve-metadata=requirements "$T3_APP" 2>/dev/null
+    --entitlements "$REPO_DIR/lib/entitlements.plist" --preserve-metadata=requirements "$T3_APP" 2>/dev/null ||
+    { log "re-signing failed; run t3-mods restore"; return 1; }
 }
 
 restore_app() {
@@ -170,7 +181,14 @@ restore_app() {
   [ "$(cat "$BACKUP.version" 2>/dev/null)" = "$(plist_value CFBundleShortVersionString)" ] ||
     log "saved copy is $(cat "$BACKUP.version"), installed is newer; restoring the saved copy anyway"
   quit_app || { log "T3 Code did not quit; not restoring"; return 1; }
-  /bin/rm -rf "$T3_APP" && /usr/bin/ditto "$BACKUP" "$T3_APP"
+  # Copy beside the app, then swap, so a failed copy leaves the current app in place.
+  local fresh="$T3_APP.t3mods-restore"
+  /bin/rm -rf "$fresh"
+  if ! /usr/bin/ditto "$BACKUP" "$fresh"; then
+    /bin/rm -rf "$fresh"; open "$T3_APP"; log "could not copy the official app back; T3 left as it is"; return 1
+  fi
+  /bin/rm -rf "$T3_APP" && /bin/mv "$fresh" "$T3_APP" ||
+    { log "restore failed midway; the official copy is at $fresh"; return 1; }
   touch "$T3MODS_HOME/paused"
   open "$T3_APP"
   log "restored the official app; patching paused (t3-mods apply resumes it)"
@@ -317,7 +335,8 @@ request() {
   local action=$1 delay=${2:-5}
   load_config
   mkdir -p "$T3MODS_HOME"
-  echo "$action $(( $(date +%s) + delay ))" > "$REQUEST"
+  # Write then rename, so a tick never reads a half-written request.
+  echo "$action $(( $(date +%s) + delay ))" > "$REQUEST.tmp" && mv -f "$REQUEST.tmp" "$REQUEST"
   if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
     echo "Requested '$action' in ${delay}s. T3 Code closes and reopens by itself; don't reopen it."
   else
