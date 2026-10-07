@@ -1,4 +1,4 @@
-From 091db8857d76b3c3b4972f62756001bb946b0f61 Mon Sep 17 00:00:00 2001
+From 42d261b902cfe942f131eaa3b602b9ec390b3ead Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 20:15:22 -0500
 Subject: [PATCH 1/4] feat(claude): draw Claude Code plugin status lines,
@@ -40,7 +40,7 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  create mode 100644 packages/contracts/src/claudePluginUi.ts
 
 diff --git a/apps/server/src/auth/RpcAuthorization.ts b/apps/server/src/auth/RpcAuthorization.ts
-index 54d8e2a9..630c6e3e 100644
+index 3cce8fbe..71f85608 100644
 --- a/apps/server/src/auth/RpcAuthorization.ts
 +++ b/apps/server/src/auth/RpcAuthorization.ts
 @@ -58,6 +58,8 @@ export const RPC_REQUIRED_SCOPES = {
@@ -53,18 +53,18 @@ index 54d8e2a9..630c6e3e 100644
    [WS_METHODS.serverUpdateServerWithProgress]: AuthOrchestrationOperateScope,
    [WS_METHODS.serverCommitDesktopUpdate]: AuthOrchestrationOperateScope,
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index b2beb04c..af751ae6 100644
+index 9af1c0ef..0d8e9735 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-@@ -108,6 +108,7 @@ import {
+@@ -107,6 +107,7 @@ import {
    shouldPersistProviderEvent,
- } from "../../provider/Layers/EventNdjsonLogger.ts";
- import * as ProviderEventLoggers from "../../provider/Layers/ProviderEventLoggers.ts";
+ } from "../../provider/EventNdjsonLogger.ts";
+ import * as ProviderEventLoggers from "../../provider/ProviderEventLoggers.ts";
 +import * as ClaudePluginUi from "../../provider/ClaudePluginUi.ts";
  import {
    claudeRateLimitEventToUpdate,
    type ClaudeScopedLimitNames,
-@@ -591,15 +592,26 @@ export function makeClaudeAgentSdkProtocolLogger(input: {
+@@ -592,15 +593,26 @@ export function makeClaudeAgentSdkProtocolLogger(input: {
    };
  }
  
@@ -78,7 +78,7 @@ index b2beb04c..af751ae6 100644
 +    : undefined;
 +};
 +
- export const claudeAgentSdkQueryRunnerLiveLayer: Layer.Layer<
+ export const layerQueryRunner: Layer.Layer<
    ClaudeAgentSdkQueryRunner,
    never,
 -  Crypto.Crypto | ProviderEventLoggers.ProviderEventLoggers
@@ -92,7 +92,7 @@ index b2beb04c..af751ae6 100644
  
      return ClaudeAgentSdkQueryRunner.of({
        allocateSessionId: crypto.randomUUIDv4.pipe(
-@@ -630,6 +642,12 @@ export const claudeAgentSdkQueryRunnerLiveLayer: Layer.Layer<
+@@ -631,6 +643,12 @@ export const layerQueryRunner: Layer.Layer<
              }),
            catch: (cause) => queryRunnerError(cause, "query"),
          });
@@ -105,7 +105,7 @@ index b2beb04c..af751ae6 100644
          yield* logProtocolEvent({
            direction: "outgoing",
            stage: "decoded",
-@@ -650,6 +668,7 @@ export const claudeAgentSdkQueryRunnerLiveLayer: Layer.Layer<
+@@ -651,6 +669,7 @@ export const layerQueryRunner: Layer.Layer<
                  payload: message,
                }),
              ),
@@ -113,7 +113,7 @@ index b2beb04c..af751ae6 100644
            ),
            offer: (message) =>
              Queue.offer(promptQueue, message).pipe(
-@@ -713,6 +732,11 @@ export const claudeAgentSdkQueryRunnerLiveLayer: Layer.Layer<
+@@ -714,6 +733,11 @@ export const layerQueryRunner: Layer.Layer<
            ),
            close: Queue.shutdown(promptQueue).pipe(
              Effect.andThen(closeClaudeQuery(queryRuntime)),
@@ -565,42 +565,42 @@ index 00000000..cbf9267f
 +});
 +
 +export const layer = Layer.effect(ClaudePluginUi, make);
-diff --git a/apps/server/src/provider/Layers/ProviderOrchestrationAdapterInfrastructure.ts b/apps/server/src/provider/Layers/ProviderOrchestrationAdapterInfrastructure.ts
-index c9d8d5e7..35743432 100644
---- a/apps/server/src/provider/Layers/ProviderOrchestrationAdapterInfrastructure.ts
-+++ b/apps/server/src/provider/Layers/ProviderOrchestrationAdapterInfrastructure.ts
+diff --git a/apps/server/src/provider/ProviderOrchestrationAdapterInfrastructure.ts b/apps/server/src/provider/ProviderOrchestrationAdapterInfrastructure.ts
+index 204ef10a..ee4c39cf 100644
+--- a/apps/server/src/provider/ProviderOrchestrationAdapterInfrastructure.ts
++++ b/apps/server/src/provider/ProviderOrchestrationAdapterInfrastructure.ts
 @@ -1,6 +1,7 @@
  import * as Layer from "effect/Layer";
  
- import * as ClaudeAdapterV2 from "../../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
-+import * as ClaudePluginUi from "../ClaudePluginUi.ts";
- import * as CodexAdapterV2 from "../../orchestration-v2/Adapters/CodexAdapterV2.ts";
- import * as CursorAgentSdk from "../../orchestration-v2/Adapters/CursorAgentSdk.ts";
- import * as IdAllocator from "../../orchestration-v2/IdAllocator.ts";
+ import * as ClaudeAdapterV2 from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
++import * as ClaudePluginUi from "./ClaudePluginUi.ts";
+ import * as CodexAdapterV2 from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
+ import * as CursorAgentSdk from "../orchestration-v2/Adapters/CursorAgentSdk.ts";
+ import * as IdAllocator from "../orchestration-v2/IdAllocator.ts";
 @@ -19,7 +20,9 @@ export type ProviderOrchestrationAdapterInfrastructure =
   * Effect layer memoization yields one shared queue.
   */
- export const ProviderOrchestrationAdapterInfrastructureLive = Layer.mergeAll(
--  ClaudeAdapterV2.claudeAgentSdkQueryRunnerLiveLayer,
+ export const layer = Layer.mergeAll(
+-  ClaudeAdapterV2.layerQueryRunner,
 +  // Same `ClaudePluginUi.layer` reference the server provides, so memoization
 +  // hands the runner and the websocket routes one shared instance.
-+  ClaudeAdapterV2.claudeAgentSdkQueryRunnerLiveLayer.pipe(Layer.provide(ClaudePluginUi.layer)),
-   CodexAdapterV2.codexAppServerClientFactoryFromSettingsLayer,
-   CursorAgentSdk.cursorAgentSdkRunnerLiveLayer,
++  ClaudeAdapterV2.layerQueryRunner.pipe(Layer.provide(ClaudePluginUi.layer)),
+   CodexAdapterV2.layerAppServerClientFactory,
+   CursorAgentSdk.layer,
    IdAllocator.layer,
 diff --git a/apps/server/src/server.ts b/apps/server/src/server.ts
-index 9e9d5c5e..863887e2 100644
+index ebbc7375..add6a8b4 100644
 --- a/apps/server/src/server.ts
 +++ b/apps/server/src/server.ts
-@@ -50,6 +50,7 @@ import * as ProviderEventIngestor from "./orchestration-v2/ProviderEventIngestor
+@@ -43,6 +43,7 @@ import * as ProviderEventIngestor from "./orchestration-v2/ProviderEventIngestor
  import * as ModelManifest from "./provider/ModelManifest.ts";
- import * as ResetCreditCoordinator from "./provider/Layers/resetCreditCoordinator.ts";
- import * as ProviderEventLoggers from "./provider/Layers/ProviderEventLoggers.ts";
+ import * as ResetCreditCoordinator from "./provider/resetCreditCoordinator.ts";
+ import * as ProviderEventLoggers from "./provider/ProviderEventLoggers.ts";
 +import * as ClaudePluginUi from "./provider/ClaudePluginUi.ts";
  import * as OpenCodeRuntime from "./provider/opencodeRuntime.ts";
  import * as OpenCodeServerLedger from "./provider/OpenCodeServerLedger.ts";
- import { AcpRegistryCatalogLive } from "./provider/Layers/AcpRegistryCatalog.ts";
-@@ -583,7 +584,12 @@ const RuntimeCoreDependenciesLive = RuntimeCoreDependenciesBaseLive.pipe(
+ import * as AcpRegistryCatalog from "./provider/AcpRegistryCatalog.ts";
+@@ -604,7 +605,12 @@ const layerRuntimeCoreDependencies = layerRuntimeCoreDependenciesBase.pipe(
    // from the repo's `model-manifest.json` on `main` and applied by the
    // Codex/Claude drivers.
    Layer.provideMerge(
@@ -613,20 +613,20 @@ index 9e9d5c5e..863887e2 100644
 +    ),
    ),
    // `OpenCodeDriver.create()` yields `OpenCodeRuntime`; previously the old
-   // `ProviderRegistryLive` pulled `OpenCodeRuntimeLive` in for itself, but
+   // `ProviderRegistry.layer` pulled `OpenCodeRuntimeLive` in for itself, but
 diff --git a/apps/server/src/ws.ts b/apps/server/src/ws.ts
-index 7800603f..7798f02f 100644
+index dcf9fad5..5fec34f7 100644
 --- a/apps/server/src/ws.ts
 +++ b/apps/server/src/ws.ts
-@@ -170,6 +170,7 @@ import * as ProviderMaintenance from "./provider/providerMaintenance.ts";
+@@ -173,6 +173,7 @@ import * as ProviderMaintenance from "./provider/providerMaintenance.ts";
  import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
- import * as ProviderAuthService from "./provider/Services/ProviderAuthService.ts";
+ import * as ProviderAuthService from "./provider/ProviderAuthService.ts";
  import { makeProviderInstallation } from "./provider/providerInstallation.ts";
 +import * as ClaudePluginUi from "./provider/ClaudePluginUi.ts";
  import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
  import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
  import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
-@@ -1267,6 +1268,7 @@ const makeWsRpcLayer = (
+@@ -1274,6 +1275,7 @@ const layerWsRpc = (
        const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
        const providerAuth = yield* ProviderAuthService.ProviderAuthService;
        const providerInstallation = yield* makeProviderInstallation();
@@ -634,7 +634,7 @@ index 7800603f..7798f02f 100644
        const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
        const config = yield* ServerConfig.ServerConfig;
        const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
-@@ -2490,6 +2492,16 @@ const makeWsRpcLayer = (
+@@ -2506,6 +2508,16 @@ const layerWsRpc = (
              providerInstallation.subscribe(input),
              { "rpc.aggregate": "provider" },
            ),
@@ -652,10 +652,10 @@ index 7800603f..7798f02f 100644
            observeRpcEffect(WS_METHODS.providerInstallRemove, providerInstallation.remove(input), {
              "rpc.aggregate": "provider",
 diff --git a/apps/web/src/components/ChatView.tsx b/apps/web/src/components/ChatView.tsx
-index ec924e2c..13d394e4 100644
+index 89b74c06..a793e1cd 100644
 --- a/apps/web/src/components/ChatView.tsx
 +++ b/apps/web/src/components/ChatView.tsx
-@@ -418,6 +418,7 @@ import {
+@@ -423,6 +423,7 @@ import {
  } from "../state/entities";
  import { environmentShell } from "../state/shell";
  import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
@@ -663,7 +663,7 @@ index ec924e2c..13d394e4 100644
  import { createPageScrollController, type PageScrollKey } from "./chat/pageScrollController";
  import { isTimelineScrollTarget } from "./chat/timelineScrollTarget";
  import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
-@@ -11127,6 +11128,9 @@ export default function ChatView(props: ChatViewProps) {
+@@ -11262,6 +11263,9 @@ export default function ChatView(props: ChatViewProps) {
                                }
                              />
                            ) : null}
@@ -972,10 +972,10 @@ index 00000000..d09ac0ec
 +  }
 +}
 diff --git a/packages/client-runtime/src/rpc/client.ts b/packages/client-runtime/src/rpc/client.ts
-index 4ce45cf3..c4c5fd7b 100644
+index 89ecebe5..75d48945 100644
 --- a/packages/client-runtime/src/rpc/client.ts
 +++ b/packages/client-runtime/src/rpc/client.ts
-@@ -48,6 +48,7 @@ export type EnvironmentSubscriptionRpcTag =
+@@ -47,6 +47,7 @@ export type EnvironmentSubscriptionRpcTag =
    | typeof WS_METHODS.codexAuthCallbackSubscribe
    | typeof WS_METHODS.providerAuthSubscribe
    | typeof WS_METHODS.providerInstallSubscribe
@@ -984,7 +984,7 @@ index 4ce45cf3..c4c5fd7b 100644
    | typeof ORCHESTRATION_V2_WS_METHODS.subscribeThread
    | typeof WS_METHODS.subscribeAuthAccess
 diff --git a/packages/client-runtime/src/state/server.ts b/packages/client-runtime/src/state/server.ts
-index 5f181839..ac6d965d 100644
+index 17037af3..9d864610 100644
 --- a/packages/client-runtime/src/state/server.ts
 +++ b/packages/client-runtime/src/state/server.ts
 @@ -1057,6 +1057,15 @@ export function createServerEnvironmentAtoms<R, E>(
@@ -1095,10 +1095,10 @@ index 00000000..f6b7edec
 +  toast: null,
 +};
 diff --git a/packages/contracts/src/index.ts b/packages/contracts/src/index.ts
-index 8690bb1b..1ee55285 100644
+index 277a341f..066edc6d 100644
 --- a/packages/contracts/src/index.ts
 +++ b/packages/contracts/src/index.ts
-@@ -18,6 +18,7 @@ export * from "./providerInstance.ts";
+@@ -19,6 +19,7 @@ export * from "./providerInstance.ts";
  export * from "./providerSetup.ts";
  export * from "./providerRuntime.ts";
  export * from "./providerUsageLimits.ts";
@@ -1107,7 +1107,7 @@ index 8690bb1b..1ee55285 100644
  export * from "./providerPolicy.ts";
  export * from "./modelSelection.ts";
 diff --git a/packages/contracts/src/rpc.ts b/packages/contracts/src/rpc.ts
-index 9fb0f186..62511457 100644
+index 4d6ec6e4..66b50a96 100644
 --- a/packages/contracts/src/rpc.ts
 +++ b/packages/contracts/src/rpc.ts
 @@ -6,6 +6,11 @@ import {
@@ -1120,9 +1120,9 @@ index 9fb0f186..62511457 100644
 +  ClaudePluginUiSubscribeInput,
 +} from "./claudePluginUi.ts";
  import * as Schema from "effect/Schema";
- import * as Rpc from "effect/unstable/rpc/Rpc";
- import * as RpcGroup from "effect/unstable/rpc/RpcGroup";
-@@ -379,6 +384,8 @@ export const WS_METHODS = {
+ import * as Rpc from "effect/rpc/Rpc";
+ import * as RpcGroup from "effect/rpc/RpcGroup";
+@@ -382,6 +387,8 @@ export const WS_METHODS = {
    providerInstallCancel: "provider.install.cancel",
    providerInstallSubscribe: "provider.install.subscribe",
    providerInstallRemove: "provider.install.remove",
@@ -1131,7 +1131,7 @@ index 9fb0f186..62511457 100644
  
    // VCS methods
    vcsPull: "vcs.pull",
-@@ -673,6 +680,18 @@ const WsProviderInstallSubscribeRpc = Rpc.make(WS_METHODS.providerInstallSubscri
+@@ -679,6 +686,18 @@ const WsProviderInstallSubscribeRpc = Rpc.make(WS_METHODS.providerInstallSubscri
    stream: true,
  });
  
@@ -1150,7 +1150,7 @@ index 9fb0f186..62511457 100644
  const WsProviderInstallRemoveRpc = Rpc.make(WS_METHODS.providerInstallRemove, {
    payload: ProviderSetupInput,
    success: ProviderInstallState,
-@@ -1718,6 +1737,8 @@ export const WsRpcGroup = RpcGroup.make(
+@@ -1750,6 +1769,8 @@ export const WsRpcGroup = RpcGroup.make(
    WsProviderInstallStartRpc,
    WsProviderInstallCancelRpc,
    WsProviderInstallSubscribeRpc,
@@ -1163,7 +1163,7 @@ index 9fb0f186..62511457 100644
 2.50.1 (Apple Git-155)
 
 
-From 27fedfde3193f3991d004d0cc6dbb2d2ca854464 Mon Sep 17 00:00:00 2001
+From ac194314449e1fedcdf552a5f4a2a6b4c6bd9173 Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 21:25:06 -0500
 Subject: [PATCH 2/4] fix(claude): draw plugin block art without seams and fit
@@ -1391,7 +1391,7 @@ index f6b7edec..d5014346 100644
 2.50.1 (Apple Git-155)
 
 
-From fd57bef80253e85b668f3bbc764ea4b6bf8365f4 Mon Sep 17 00:00:00 2001
+From e31c37ba90de3426468686bd59a26b86d56d4217 Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 07:40:10 -0500
 Subject: [PATCH 3/4] fix(claude): bound plugin UI memory and ignore replaced
@@ -1412,10 +1412,10 @@ Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
  3 files changed, 119 insertions(+), 37 deletions(-)
 
 diff --git a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-index af751ae6..d2d8b780 100644
+index 0d8e9735..b2eb42de 100644
 --- a/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
 +++ b/apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts
-@@ -668,7 +668,7 @@ export const claudeAgentSdkQueryRunnerLiveLayer: Layer.Layer<
+@@ -669,7 +669,7 @@ export const layerQueryRunner: Layer.Layer<
                  payload: message,
                }),
              ),
@@ -1683,7 +1683,7 @@ index d8dc29f5..7e4cfff2 100644
 2.50.1 (Apple Git-155)
 
 
-From 7616fc3d6e9264ea20dc2c0ebca82c94ff51dff8 Mon Sep 17 00:00:00 2001
+From d036e40ef72c606c6ba2c604f78e27d78a750acf Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 07:52:24 -0500
 Subject: [PATCH 4/4] docs(claude): document plugin UI service and band

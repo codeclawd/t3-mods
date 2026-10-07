@@ -321,12 +321,16 @@ tick() {
   fi
 
   if [ "$built" != "$want" ]; then
+    # A build that failed stays failed until the release or a patch changes;
+    # retrying it every tick only burns CPU and floods the log.
+    [ "$(cat "$T3MODS_HOME/.failed" 2>/dev/null)" = "$want" ] && [ "$request" != apply ] && return 0
     log "building $want"
     local status=0; ( build "$version" "$want" "$refs" ) || status=$?
     case "$status" in
       0) ;;
       3) return 0 ;;
       *)
+        printf '%s\n' "$want" > "$T3MODS_HOME/.failed"
         if [ "$(cat "$T3MODS_HOME/.notified" 2>/dev/null)" != "fail $want" ]; then
           notify "Your T3 patches don't apply to $version yet. T3 runs unpatched; see $LOG."
           printf 'fail %s\n' "$want" > "$T3MODS_HOME/.notified"
