@@ -1,7 +1,7 @@
 From 42d261b902cfe942f131eaa3b602b9ec390b3ead Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 20:15:22 -0500
-Subject: [PATCH 1/5] feat(claude): draw Claude Code plugin status lines,
+Subject: [PATCH 1/6] feat(claude): draw Claude Code plugin status lines,
  toasts and prompt band
 
 Claude Code plugins draw UI with $.ui.status, $.ui.toast and an
@@ -1166,7 +1166,7 @@ index 4d6ec6e4..66b50a96 100644
 From ac194314449e1fedcdf552a5f4a2a6b4c6bd9173 Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 21:25:06 -0500
-Subject: [PATCH 2/5] fix(claude): draw plugin block art without seams and fit
+Subject: [PATCH 2/6] fix(claude): draw plugin block art without seams and fit
  the band's width
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1394,7 +1394,7 @@ index f6b7edec..d5014346 100644
 From e31c37ba90de3426468686bd59a26b86d56d4217 Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 07:40:10 -0500
-Subject: [PATCH 3/5] fix(claude): bound plugin UI memory and ignore replaced
+Subject: [PATCH 3/6] fix(claude): bound plugin UI memory and ignore replaced
  queries
 
 - Each subscriber now gets a one-slot change signal and reads the current
@@ -1686,7 +1686,7 @@ index d8dc29f5..7e4cfff2 100644
 From d036e40ef72c606c6ba2c604f78e27d78a750acf Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 07:52:24 -0500
-Subject: [PATCH 4/5] docs(claude): document plugin UI service and band
+Subject: [PATCH 4/6] docs(claude): document plugin UI service and band
  renderer functions
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
@@ -1847,7 +1847,7 @@ index c573e2b1..a2d8ad37 100644
 From 589616afd4994c426ed536018645d1404beaa9ad Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Tue, 6 Oct 2026 20:35:37 -0500
-Subject: [PATCH 5/5] feat(claude): draw plugin Svg elements and join as a
+Subject: [PATCH 5/6] feat(claude): draw plugin Svg elements and join as a
  desktop surface
 
 Svg elements draw as images (a data: URL), which never run scripts. On attach the server sends ui_attach as a desktop surface, so plugins that wait for one (session.attach, $.session.surfaces()) draw right away instead of on their own timer. Verified with centminmod's desktop-statusline: its band with Svg meters arrives about 5.6 s after a cold Claude start.
@@ -1973,6 +1973,140 @@ index a2d8ad37..d98cfd23 100644
        return null;
    }
  }
+-- 
+2.50.1 (Apple Git-155)
+
+
+From be0968181a58a8bb5d64b05a9c531b6567ddb668 Mon Sep 17 00:00:00 2001
+From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 20:50:37 -0500
+Subject: [PATCH 6/6] fix(claude): lay out plugin bands with Claude Desktop's
+ metrics
+
+T3 joins sessions as a desktop surface, so draw like Claude Desktop: proportional text, a Box size unit of 15 px, Svg sizes in px, and bodyColumns at 12.5 px per column (66 for T3's composer). All in em, so a narrower composer scales the band down. Block-character art keeps a monospace grid. Fixes desktop-statusline's meters colliding in a band laid out with terminal metrics.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../components/chat/ClaudePluginUiBand.tsx    | 51 +++++++++++++------
+ packages/contracts/src/claudePluginUi.ts      |  7 +--
+ 2 files changed, 40 insertions(+), 18 deletions(-)
+
+diff --git a/apps/web/src/components/chat/ClaudePluginUiBand.tsx b/apps/web/src/components/chat/ClaudePluginUiBand.tsx
+index d98cfd23..e2cfd036 100644
+--- a/apps/web/src/components/chat/ClaudePluginUiBand.tsx
++++ b/apps/web/src/components/chat/ClaudePluginUiBand.tsx
+@@ -63,13 +63,14 @@ export function ClaudePluginUiBand(props: {
+   };
+ 
+   return (
+-    <div className="mx-auto mb-1.5 flex w-full max-w-208 flex-col gap-1 px-1 font-mono text-xs leading-tight">
++    <div className="mx-auto mb-1.5 flex w-full max-w-208 flex-col gap-1 px-1 text-xs leading-tight">
+       {snapshot.band === null ? null : (
+-        <div className="overflow-x-auto rounded-md border border-border/60 bg-muted/30 px-2 py-1.5 leading-none [container-type:inline-size]">
+-          {/* Shrink below text-xs when the composer is narrower than the plugin's columns. */}
++        <div className="overflow-x-auto rounded-md border border-border/60 bg-muted/30 px-2.5 py-2 [container-type:inline-size]">
++          {/* Desktop metrics, in em so the band shrinks when the composer is narrower than the plugin's columns. */}
+           <div
+             style={{
+-              fontSize: `min(0.75rem, calc(100cqi / ${CLAUDE_PLUGIN_UI_BAND_COLUMNS * MONO_CH_EM}))`,
++              fontSize: `min(${DESKTOP_FONT_PX}px, calc(100cqi / ${(CLAUDE_PLUGIN_UI_BAND_COLUMNS * DESKTOP_COLUMN_PX) / DESKTOP_FONT_PX}))`,
++              lineHeight: DESKTOP_LINE_EM,
+             }}
+           >
+             {renderNode(snapshot.band, "band", press)}
+@@ -91,13 +92,32 @@ export function ClaudePluginUiBand(props: {
+ 
+ type Press = (target: { plugin: string; handle: number }, key: string | undefined) => void;
+ 
+-/** A horizontal size in terminal cells (`ch`); strings pass through as CSS. */
++// The desktop surface's metrics, as plugins written for Claude Desktop measure them:
++// text in the app's proportional font, a Box size unit of 15 CSS px, and a band
++// column (`bodyColumns`) of 12.5 CSS px. Sizes are kept in em of the base size.
++const DESKTOP_FONT_PX = 14;
++const DESKTOP_CELL_PX = 15;
++const DESKTOP_COLUMN_PX = 12.5;
++const DESKTOP_LINE_EM = 1.4;
++
++/** CSS px from a plugin, as em of the band's base size, so it scales with the band. */
++const px = (value: number): string => `${value / DESKTOP_FONT_PX}em`;
++
++/** A horizontal Box size in desktop cells; strings pass through as CSS. */
+ const cells = (value: unknown): string | undefined =>
+-  typeof value === "number" ? `${value}ch` : typeof value === "string" ? value : undefined;
++  typeof value === "number"
++    ? px(value * DESKTOP_CELL_PX)
++    : typeof value === "string"
++      ? value
++      : undefined;
+ 
+-/** A vertical size in terminal rows; strings pass through as CSS. */
++/** A vertical Box size in rows; strings pass through as CSS. */
+ const lines = (value: unknown): string | undefined =>
+-  typeof value === "number" ? `${value * 1.25}em` : typeof value === "string" ? value : undefined;
++  typeof value === "number"
++    ? `${value * DESKTOP_LINE_EM}em`
++    : typeof value === "string"
++      ? value
++      : undefined;
+ 
+ /** Ink-style color names and hex pass through; `ansi256(n)` has no CSS twin and is dropped. */
+ const color = (value: unknown): string | undefined =>
+@@ -214,9 +234,6 @@ function safeHref(value: unknown): string | undefined {
+ /** The most SVG markup a plugin may hand the desktop surface (`SvgProps.source`). */
+ const SVG_MAX_CHARS = 131_072;
+ 
+-/** Width of one monospace cell in em (SF Mono and Menlo are 0.6). */
+-const MONO_CH_EM = 0.6;
+-
+ // Block elements drawn as shapes, not glyphs: a font's block glyphs leave
+ // anti-aliased seams between cells, which stripes plugin pixel art.
+ // Quadrant bits: 8 top-left, 4 top-right, 2 bottom-left, 1 bottom-right.
+@@ -300,8 +317,9 @@ function renderText(text: string, key: string): ReactNode {
+     index += count;
+   }
+   if (plain !== "") parts.push(plain);
++  // Block art keeps a monospace grid even though the band's text is proportional.
+   return (
+-    <span key={key} className="whitespace-pre">
++    <span key={key} className="whitespace-pre font-mono leading-none">
+       {parts}
+     </span>
+   );
+@@ -399,9 +417,12 @@ function renderNode(node: ClaudePluginUiElement, path: string, press: Press): Re
+           key={key}
+           alt={typeof props.alt === "string" ? props.alt : ""}
+           src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(source)}`}
+-          width={typeof props.width === "number" ? props.width : undefined}
+-          height={typeof props.height === "number" ? props.height : undefined}
+-          style={{ display: "inline-block", verticalAlign: "middle" }}
++          style={{
++            display: "inline-block",
++            verticalAlign: "middle",
++            ...(typeof props.width === "number" ? { width: px(props.width) } : {}),
++            ...(typeof props.height === "number" ? { height: px(props.height) } : {}),
++          }}
+         />
+       );
+     }
+diff --git a/packages/contracts/src/claudePluginUi.ts b/packages/contracts/src/claudePluginUi.ts
+index d5014346..dc63429b 100644
+--- a/packages/contracts/src/claudePluginUi.ts
++++ b/packages/contracts/src/claudePluginUi.ts
+@@ -79,10 +79,11 @@ export const ClaudePluginUiPressInput = Schema.Struct({
+ export type ClaudePluginUiPressInput = typeof ClaudePluginUiPressInput.Type;
+ 
+ /**
+- * Terminal columns the band is laid out for. The server asks plugins to fit
+- * this width; clients scale the font so it fits theirs.
++ * Columns the band is laid out for. Claude Desktop measures a band column as
++ * 12.5 CSS px, so 66 is T3's composer width (about 830 px). The server asks
++ * plugins to fit this; clients scale the band down when they are narrower.
+  */
+-export const CLAUDE_PLUGIN_UI_BAND_COLUMNS = 100;
++export const CLAUDE_PLUGIN_UI_BAND_COLUMNS = 66;
+ 
+ export const EMPTY_CLAUDE_PLUGIN_UI_SNAPSHOT: ClaudePluginUiSnapshot = {
+   statuses: [],
 -- 
 2.50.1 (Apple Git-155)
 
