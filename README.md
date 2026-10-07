@@ -55,6 +55,9 @@ render yet.
 
 The band appears once the thread's first prompt starts its Claude session.
 
+For a one-prompt setup of desktop-statusline in T3, see
+[codeclawd/claude-plugins](https://github.com/codeclawd/claude-plugins).
+
 ## Add your own T3 patches
 
 The T3 change ships in this repo as `patches/claude-plugin-ui.patch`, so you don't need a fork of

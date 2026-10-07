@@ -40,19 +40,16 @@ If it fails, read `~/.t3-mods/agent.log`, `~/.t3-mods/last-install.log` and
 
 ## 3. Apply
 
-T3 must restart to load the patch. You are probably running inside T3, so restarting it ends your
-session. Before you run the command, tell the user:
+T3 must restart once to load the patch. **Don't quit or restart T3 yourself.** You are probably
+running inside T3, and closing it ends your session and any other agent the user has running. Tell
+the user:
 
-> T3 Code will close and reopen by itself in about 30 seconds. Don't reopen it yourself. When macOS
-> asks for your password to read T3's keychain item, click Always Allow.
+> t3-mods is installed. Quit T3 Code (⌘Q) when it suits you and reopen it after about 15 seconds;
+> the patch applies while it's closed. If macOS asks to let T3 read its keychain item or a folder,
+> click Allow.
 
-Then run:
-
-```sh
-bin/t3-mods apply 20
-```
-
-The agent waits 20 seconds, so your message reaches the user first.
+Only if the user asks you to restart T3 for them, run `bin/t3-mods apply 20`, tell them not to
+reopen T3 themselves, and end your turn.
 
 ## 4. Verify
 
