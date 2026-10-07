@@ -1,7 +1,7 @@
 From 42d261b902cfe942f131eaa3b602b9ec390b3ead Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 20:15:22 -0500
-Subject: [PATCH 1/4] feat(claude): draw Claude Code plugin status lines,
+Subject: [PATCH 1/5] feat(claude): draw Claude Code plugin status lines,
  toasts and prompt band
 
 Claude Code plugins draw UI with $.ui.status, $.ui.toast and an
@@ -1166,7 +1166,7 @@ index 4d6ec6e4..66b50a96 100644
 From ac194314449e1fedcdf552a5f4a2a6b4c6bd9173 Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Sun, 4 Oct 2026 21:25:06 -0500
-Subject: [PATCH 2/4] fix(claude): draw plugin block art without seams and fit
+Subject: [PATCH 2/5] fix(claude): draw plugin block art without seams and fit
  the band's width
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
@@ -1394,7 +1394,7 @@ index f6b7edec..d5014346 100644
 From e31c37ba90de3426468686bd59a26b86d56d4217 Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 07:40:10 -0500
-Subject: [PATCH 3/4] fix(claude): bound plugin UI memory and ignore replaced
+Subject: [PATCH 3/5] fix(claude): bound plugin UI memory and ignore replaced
  queries
 
 - Each subscriber now gets a one-slot change signal and reads the current
@@ -1686,7 +1686,7 @@ index d8dc29f5..7e4cfff2 100644
 From d036e40ef72c606c6ba2c604f78e27d78a750acf Mon Sep 17 00:00:00 2001
 From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 07:52:24 -0500
-Subject: [PATCH 4/4] docs(claude): document plugin UI service and band
+Subject: [PATCH 4/5] docs(claude): document plugin UI service and band
  renderer functions
 
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
@@ -1840,6 +1840,139 @@ index c573e2b1..a2d8ad37 100644
  function renderNode(node: ClaudePluginUiElement, path: string, press: Press): ReactNode {
    const props = node.props ?? {};
    const key = typeof props.key === "string" ? props.key : path;
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 589616afd4994c426ed536018645d1404beaa9ad Mon Sep 17 00:00:00 2001
+From: HalalifyMusic <244228683+HalalifyMusic@users.noreply.github.com>
+Date: Tue, 6 Oct 2026 20:35:37 -0500
+Subject: [PATCH 5/5] feat(claude): draw plugin Svg elements and join as a
+ desktop surface
+
+Svg elements draw as images (a data: URL), which never run scripts. On attach the server sends ui_attach as a desktop surface, so plugins that wait for one (session.attach, $.session.surfaces()) draw right away instead of on their own timer. Verified with centminmod's desktop-statusline: its band with Svg meters arrives about 5.6 s after a cold Claude start.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../src/provider/ClaudePluginUi.test.ts       | 12 +++++++---
+ apps/server/src/provider/ClaudePluginUi.ts    | 24 ++++++++++++++++++-
+ .../components/chat/ClaudePluginUiBand.tsx    | 20 +++++++++++++++-
+ 3 files changed, 51 insertions(+), 5 deletions(-)
+
+diff --git a/apps/server/src/provider/ClaudePluginUi.test.ts b/apps/server/src/provider/ClaudePluginUi.test.ts
+index 9e231779..568fe6a1 100644
+--- a/apps/server/src/provider/ClaudePluginUi.test.ts
++++ b/apps/server/src/provider/ClaudePluginUi.test.ts
+@@ -80,9 +80,15 @@ describe("ClaudePluginUi", () => {
+       yield* service.attach(threadId, request);
+       const drawn = yield* awaitSnapshot(service, (snapshot) => snapshot.band !== null);
+       assert.deepStrictEqual(drawn.band, band);
+-      assert.strictEqual(requests[0]?.subtype, "ui_render");
+-      assert.strictEqual(requests[0]?.surface, "desktop");
+-      assert.strictEqual(requests[0]?.component, "AbovePrompt");
++      // It joins as a desktop surface first, so plugins waiting for one start drawing.
++      assert.deepStrictEqual(requests[0], {
++        subtype: "ui_attach",
++        surface: "desktop",
++        client_id: "t3-code",
++      });
++      const render = requests.find((body) => body.subtype === "ui_render");
++      assert.strictEqual(render?.surface, "desktop");
++      assert.strictEqual(render?.component, "AbovePrompt");
+ 
+       hooked = false;
+       yield* service.ingest(threadId, { type: "system", subtype: "ui_invalidate" }, request);
+diff --git a/apps/server/src/provider/ClaudePluginUi.ts b/apps/server/src/provider/ClaudePluginUi.ts
+index a11af5a1..df1377f0 100644
+--- a/apps/server/src/provider/ClaudePluginUi.ts
++++ b/apps/server/src/provider/ClaudePluginUi.ts
+@@ -31,6 +31,8 @@ import * as Stream from "effect/Stream";
+ export type ClaudeControlRequest = (request: Record<string, unknown>) => Promise<unknown>;
+ 
+ const BAND_INSTANCE_ID = "above-prompt";
++/** How this client names itself on the session's roster of desktop surfaces. */
++const CLIENT_ID = "t3-code";
+ const BAND_MAX_ROWS = 12;
+ 
+ interface ThreadEntry {
+@@ -136,6 +138,7 @@ export const make = Effect.sync(() => {
+       request({
+         subtype: "ui_render",
+         surface: "desktop",
++        client_id: CLIENT_ID,
+         component: "AbovePrompt",
+         instance_id: BAND_INSTANCE_ID,
+         props: {
+@@ -191,10 +194,29 @@ export const make = Effect.sync(() => {
+     });
+ 
+   /** Registers a thread's live query and asks it for the band. */
++  /**
++   * Joins the session as a desktop surface. Plugins that wait for one (`session.attach`,
++   * `$.session.surfaces()`) start drawing right away instead of on their next timer.
++   */
++  const announce = (threadId: ThreadId, request: ClaudeControlRequest) =>
++    Effect.tryPromise(() =>
++      request({ subtype: "ui_attach", surface: "desktop", client_id: CLIENT_ID }),
++    ).pipe(
++      Effect.catchCause((cause) =>
++        Effect.logDebug("claude-plugin-ui.attach-failed", { threadId, cause }),
++      ),
++      Effect.asVoid,
++    );
++
+   const attach: ClaudePluginUiShape["attach"] = (threadId, request) =>
+     Effect.suspend(() => {
+       entryFor(threadId).request = request;
+-      return requestRender(threadId);
++      // Off the caller's fiber: control responses arrive with the message stream it starts.
++      return announce(threadId, request).pipe(
++        Effect.andThen(requestRender(threadId)),
++        Effect.forkDetach,
++        Effect.asVoid,
++      );
+     });
+ 
+   /** Clears a thread's plugin UI when the query that attached it closes. */
+diff --git a/apps/web/src/components/chat/ClaudePluginUiBand.tsx b/apps/web/src/components/chat/ClaudePluginUiBand.tsx
+index a2d8ad37..d98cfd23 100644
+--- a/apps/web/src/components/chat/ClaudePluginUiBand.tsx
++++ b/apps/web/src/components/chat/ClaudePluginUiBand.tsx
+@@ -211,6 +211,9 @@ function safeHref(value: unknown): string | undefined {
+   }
+ }
+ 
++/** The most SVG markup a plugin may hand the desktop surface (`SvgProps.source`). */
++const SVG_MAX_CHARS = 131_072;
++
+ /** Width of one monospace cell in em (SF Mono and Menlo are 0.6). */
+ const MONO_CH_EM = 0.6;
+ 
+@@ -387,8 +390,23 @@ function renderNode(node: ClaudePluginUiElement, path: string, press: Press): Re
+         </span>
+       );
+     }
++    case "Svg": {
++      // An SVG drawn as an image never runs scripts, unlike inline markup.
++      const source = typeof props.source === "string" ? props.source : null;
++      if (source === null || source.length > SVG_MAX_CHARS) return null;
++      return (
++        <img
++          key={key}
++          alt={typeof props.alt === "string" ? props.alt : ""}
++          src={`data:image/svg+xml;charset=utf-8,${encodeURIComponent(source)}`}
++          width={typeof props.width === "number" ? props.width : undefined}
++          height={typeof props.height === "number" ? props.height : undefined}
++          style={{ display: "inline-block", verticalAlign: "middle" }}
++        />
++      );
++    }
+     default:
+-      // Input, Select, Svg, Client: not drawn on this surface yet.
++      // Input, Select, Client: not drawn on this surface yet.
+       return null;
+   }
+ }
 -- 
 2.50.1 (Apple Git-155)
 

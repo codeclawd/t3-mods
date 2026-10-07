@@ -47,8 +47,11 @@ keychain item and your folders. Click **Allow**; with the key in place, those an
 Any Claude Code plugin that calls `$.ui.status`, `$.ui.toast`, or hooks `ui.render` on
 `AbovePrompt`. T3 draws them the way Claude Code Desktop does: one status line per plugin, toasts
 through T3's own notifications, and every plugin's band stacked in the order the engine chains
-them. Text, colours, boxes, buttons, links and block-character art render. Panes, text fields,
-selects and custom `Client` modules don't render yet.
+them. Text, colours, boxes, buttons, links, SVG images and block-character art render. T3 joins each
+session as a desktop surface, so plugins that wait for one (for example
+[desktop-statusline](https://github.com/centminmod/claude-plugins/tree/master/plugins/desktop-statusline))
+draw as soon as the session starts. Panes, text fields, selects and custom `Client` modules don't
+render yet.
 
 The band appears once the thread's first prompt starts its Claude session.
 
